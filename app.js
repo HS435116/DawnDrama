@@ -23,7 +23,15 @@ const APP_VERSION = '2.8.1';
 //   2) 把 latest.json 的 version 改成新版本号, 并在 notes 写更新说明
 //      (清单版本必须 > 用户当前版本, 老版本用户才会收到提醒)
 //   3) url 留空表示"暂无下载地址", 界面会引导用户去项目主页
-const DEFAULT_UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/HS435116/DawnDrama/main/latest.json';
+// 更新清单候选地址 (按顺序尝试, 第一个成功的即生效):
+//   1) 自建下载站 —— 国内可达, 与安装包同一域名
+//   2) GitHub raw  —— 备用源 (部分网络下不可达, 所以放后面)
+// 只读第一项即可; 任何一项都不可达时静默跳过, 不影响任何功能
+const UPDATE_MANIFEST_URLS = [
+    'http://78oq264463tb.vicp.fun/latest.json',
+    'https://raw.githubusercontent.com/HS435116/DawnDrama/main/latest.json'
+];
+const DEFAULT_UPDATE_MANIFEST_URL = UPDATE_MANIFEST_URLS[0];   // 兼容旧引用 (界面默认显示第一个源)
 // 项目主页: 清单里未提供下载地址时的兜底入口
 const PROJECT_HOMEPAGE = 'https://github.com/HS435116/DawnDrama';
 
@@ -2102,6 +2110,25 @@ class AgnesVideoGenerator {
         return 0;
     }
 
+    /**
+     * 抓取一个更新清单地址 (带 6 秒超时)。
+     * 没有超时的话, 一个"连不上但不立刻报错"的源会把检查卡住很久。
+     * @returns {Promise<object|null>} 清单对象 (必须含 version), 失败返回 null
+     */
+    async _fetchManifest(url) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => { try { ac.abort(); } catch (_) { /* 已结束 */ } }, 6000);
+        try {
+            const resp = await fetch(url, { cache: 'no-store', signal: ac.signal });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const manifest = await resp.json();
+            if (!String(manifest && manifest.version || '').trim()) throw new Error('清单缺少 version 字段');
+            return manifest;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
     async checkForUpdates(silent = false) {
         // 更新源地址: 可在更新页临时填入; 未配置/不可达时静默跳过, 不影响任何功能
         // 注意: 更新页已渲染时以输入框为准, 且允许"清空输入框"来撤销自定义地址、回退到内置默认清单
@@ -2111,17 +2138,26 @@ class AgnesVideoGenerator {
             if (typed) localStorage.setItem('agnes_update_url', typed);
             else localStorage.removeItem('agnes_update_url');
         }
-        const url = (localStorage.getItem('agnes_update_url') || DEFAULT_UPDATE_MANIFEST_URL).trim();
+        // 用户手填的地址优先; 否则按内置候选列表依次尝试 (自建下载站 -> GitHub)
+        const custom = (localStorage.getItem('agnes_update_url') || '').trim();
+        const candidates = custom ? [custom] : UPDATE_MANIFEST_URLS.slice();
         const result = document.getElementById('update-result');
-        if (!url) {
+        if (candidates.length === 0) {
             if (!silent) this.showStatus('⚠️ 未配置更新源地址。可在下方填入更新清单 URL 后检查 (离线时所有功能不受影响)', 'warning');
             return null;
         }
         if (!silent && result) { result.textContent = '🔍 正在检查更新...'; result.className = 'status-message warning'; result.style.display = 'block'; }
         try {
-            const resp = await fetch(url, { cache: 'no-store' });
-            if (!resp.ok) throw new Error('HTTP ' + resp.status);
-            const manifest = await resp.json();
+            // 逐个候选尝试: 单个源不可达/超时/清单不合法就换下一个, 全部失败才放弃
+            let manifest = null, url = '';
+            for (const cand of candidates) {
+                try {
+                    const r = await this._fetchManifest(cand);
+                    if (r) { manifest = r; url = cand; break; }
+                } catch (e) { console.warn(`更新源不可用 (${cand}): ${e.message}`); }
+            }
+            if (!manifest) throw new Error('所有更新源均不可用');
+            this._manifestUrlUsed = url;
             const latest = String(manifest.version || '').trim();
             if (!latest) throw new Error('清单缺少 version 字段');
             const info = { version: latest, notes: String(manifest.notes || ''), url: String(manifest.url || ''), date: String(manifest.date || '') };
@@ -2161,7 +2197,7 @@ class AgnesVideoGenerator {
         this.switchTab('update');
         const body = document.getElementById('update-body');
         if (!body) return;
-        const url = localStorage.getItem('agnes_update_url') || DEFAULT_UPDATE_MANIFEST_URL;
+        const url = localStorage.getItem('agnes_update_url') || this._manifestUrlUsed || UPDATE_MANIFEST_URLS[0];
         let infoHtml = '';
         if (info) {
             infoHtml = '<div class="info-row"><span class="info-label">最新版本:</span><span class="info-value">v' + this.escapeHtml(info.version) + (info.date ? ' (' + this.escapeHtml(info.date) + ')' : '') + '</span></div>'
@@ -2182,7 +2218,7 @@ class AgnesVideoGenerator {
                 '<div class="form-group">' +
                     '<label for="update-url-input">更新清单地址 (latest.json 格式: version/notes/url)</label>' +
                     '<input type="text" id="update-url-input" value="' + this.escapeAttr(url) + '" placeholder="https://你的域名/latest.json">' +
-                    '<small>默认指向本项目仓库根目录的 latest.json；如需自建更新服务，把地址改成你自己的清单并点"检查更新"。留空或不可达时不影响任何功能使用</small>' +
+                    '<small>默认优先使用自建下载站的 latest.json (另一个内置备用源为项目仓库)；填入自定义地址后只用你填的这一个。留空或不可达时不影响任何功能使用</small>' +
                 '</div>' +
                 '<div class="form-actions" style="border: none; padding-top: 10px;">' +
                     '<button class="btn btn-primary" onclick="checkForUpdates()">🔍 检查更新</button>' +
