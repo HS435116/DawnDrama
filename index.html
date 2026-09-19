@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<!--
+  晨曦短剧梦工坊 — 主界面
+  Copyright (c) 2026 @ 晨曦微光工作室
+  本软件基于 MIT 许可证开源发布
+-->
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="author" content="晨曦微光工作室">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>晨曦短剧梦工坊</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎬</text></svg>">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- 无边框窗口标题栏 (仅桌面应用模式显示, 拖拽区 + 窗口控制) -->
+    <div id="desktop-titlebar" style="display: none;">
+        <div class="dtb-icon"><img src="assets/logo.png" alt="晨曦短剧梦工坊"></div>
+        <div class="dtb-title">晨曦短剧梦工坊</div>
+        <div class="dtb-spacer"></div>
+        <div class="dtb-actions">
+            <button id="dtb-min" title="最小化">─</button>
+            <button id="dtb-max" title="最大化 / 还原">□</button>
+            <button id="dtb-close" title="关闭" class="dtb-close">✕</button>
+        </div>
+    </div>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <h1>🎬 晨曦短剧梦工坊</h1>
+                <p>多平台批量视频生成 · 火山方舟 / OpenAI 兼容 / 自定义</p>
+            </div>
+            <div class="header-actions">
+                <button class="btn btn-secondary" id="update-tab" onclick="showUpdatePage()" title="查看当前版本 / 检查更新">🔄 版本更新</button>
+                <button class="btn btn-secondary" onclick="showHelp()">📖 帮助</button>
+                <button class="btn btn-secondary" onclick="exportSettings()">💾 导出设置</button>
+            </div>
+        </header>
+
+        <!-- Navigation Tabs -->
+        <nav class="nav-tabs">
+            <button class="tab-btn active" data-tab="generate">🎥 批量生成</button>
+            <button class="tab-btn" data-tab="workshop">📖 短剧工坊</button>
+            <button class="tab-btn" data-tab="gallery">🖼️ 作品库</button>
+            <button class="tab-btn" data-tab="models">⚙️ 模型设置</button>
+            <button class="tab-btn" data-tab="history">📋 历史记录</button>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Generate Tab -->
+            <section id="generate" class="tab-content active">
+                <div class="panel">
+                    <h2>📝 生成配置</h2>
+
+                    <div class="form-grid">
+                        <div class="form-group full-width">
+                            <label for="title">📌 项目标题 *</label>
+                            <input type="text" id="title" placeholder="输入项目标题，如：都市风云录" required>
+                            <small>完成后视频将保存到「模型设置 → 保存位置」下的 video/&lt;标题&gt;/ 目录</small>
+                        </div>
+
+                        <div class="form-group full-width">
+                            <label for="prompt">✍️ 主提示词 <small>(优先使用：非空时自动拆分为分镜场景；留空才用下方批量场景列表)</small></label>
+                            <textarea id="prompt" rows="4" placeholder="描述想要的画面、镜头运动、光影氛围...（点击「开始批量生成」后将按此主提示词自动生成分镜场景）"></textarea>
+                            <div class="prompt-split-row">
+                                <label for="prompt-scene-count">🧩 自动拆分分镜数</label>
+                                <input type="number" id="prompt-scene-count" value="4" min="1" max="12">
+                                <small>由「剧本AI」文本模型把主提示词扩写成连续分镜；填 1 表示整段主提示词作为单个分镜。未配置文本模型时改为按行拆分，仅一行则输出单个分镜</small>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="duration">⏱️ 视频时长 (秒)</label>
+                            <input type="number" id="duration" value="5" min="1" max="60">
+                            <small>生成完成后作品库会显示实际时长；部分免费平台仅支持固定时长档位，可能忽略该设定</small>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="resolution">📐 分辨率</label>
+                            <select id="resolution">
+                                <option value="480p">480P (快速)</option>
+                                <option value="720p" selected>720P (标准)</option>
+                                <option value="1080p">1080P (高清)</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="ratio">🖼️ 画面比例</label>
+                            <select id="ratio">
+                                <option value="16:9" selected>16:9 (横屏)</option>
+                                <option value="9:16">9:16 (竖屏/短剧)</option>
+                                <option value="1:1">1:1 (方形)</option>
+                                <option value="4:3">4:3</option>
+                                <option value="3:4">3:4</option>
+                                <option value="21:9">21:9 (电影宽幅)</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="batch-count">🔢 每个场景生成次数</label>
+                            <input type="number" id="batch-count" value="1" min="1" max="20">
+                        </div>
+                    </div>
+
+                    <div class="form-group full-width">
+                        <label>📊 批量场景列表 <small>(主提示词留空时使用 — 每行一个场景，多场景将并行提交)</small></label>
+                        <div id="batch-list" class="batch-list"></div>
+                        <button class="btn btn-secondary" onclick="addBatchItem()">+ 添加新场景</button>
+                    </div>
+
+                    <div class="form-actions">
+                        <button class="btn btn-primary btn-large" onclick="startGeneration()">🚀 开始批量生成</button>
+                        <button class="btn btn-danger" id="stop-btn" onclick="stopGeneration()">⏹️ 停止</button>
+                        <button class="btn btn-secondary" id="scan-btn" onclick="scanTasks()">🔍 任务扫描 (查状态/去重)</button>
+                        <button class="btn btn-secondary" onclick="clearForm()">🗑️ 清空</button>
+                    </div>
+
+                    <!-- 任务扫描进度 -->
+                    <div id="scan-progress" style="display: none; margin-top: 14px; background: var(--bg-color); border-radius: var(--radius); padding: 14px 16px;">
+                        <div style="display: flex; justify-content: space-between; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 6px;">
+                            <span id="scan-status-text">准备扫描...</span>
+                            <span id="scan-progress-percent">0%</span>
+                        </div>
+                        <div class="progress-bar-mini" style="height: 8px;">
+                            <div class="progress-fill-mini" id="scan-progress-fill" style="width: 0%"></div>
+                        </div>
+                        <div id="scan-summary" style="margin-top: 8px; font-size: 0.85rem; color: var(--text-muted);"></div>
+                    </div>
+
+                    <!-- 未完成任务找回 (刷新页面/断网重连后自动恢复) -->
+                    <div id="unfinished-panel" style="display: none; margin-top: 14px; background: var(--bg-color); border-radius: var(--radius); padding: 14px 16px; border-left: 3px solid var(--warning-color);">
+                        <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
+                            <h3 style="margin: 0; font-size: 1rem;">♻️ 未完成的生成任务 <span id="unfinished-count" style="color: var(--warning-color);"></span></h3>
+                            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                                <button class="btn btn-small btn-primary" onclick="generator.retryAllUnfinished()">🔄 全部重试</button>
+                                <button class="btn btn-small btn-secondary" onclick="generator.scanUnfinishedTasks()">🔍 查状态并找回</button>
+                                <button class="btn btn-small btn-danger" onclick="generator.clearUnfinishedTasks()" title="删除这些未完成任务记录，避免任务扫描继续留存它们；不会删除已保存的视频文件">🧹 清理未完成</button>
+                                <button class="btn btn-small btn-secondary" onclick="generator.hideUnfinishedPanel()">收起</button>
+                            </div>
+                        </div>
+                        <div id="unfinished-hint" style="font-size: 0.8rem; color: var(--text-muted); margin-top: 6px; line-height: 1.6;"></div>
+                        <div id="unfinished-list" style="margin-top: 10px; display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto;"></div>
+                    </div>
+                </div>
+
+                <!-- Progress Panel -->
+                <div class="panel" id="progress-panel" style="display: none;">
+                    <h2>📈 生成进度</h2>
+                    <div class="progress-container">
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progress-fill" style="width: 0%"></div>
+                        </div>
+                        <p class="progress-text" id="progress-text">准备中...</p>
+                    </div>
+                    <!-- 后期处理: 音频识别 + 中文字幕烧录 (生成完成后自动执行) -->
+                    <div id="post-progress-panel" class="post-progress-panel" style="display: none;">
+                        <div class="post-progress-head">
+                            <span id="post-status-text">🎙️ 音频识别与中文字幕</span>
+                            <span id="post-progress-percent">0%</span>
+                        </div>
+                        <div class="progress-bar-mini" style="height: 8px;">
+                            <div class="progress-fill-mini" id="post-progress-fill" style="width: 0%"></div>
+                        </div>
+                        <div id="post-detail" class="post-progress-detail"></div>
+                    </div>
+                    <div class="batch-status" id="batch-status"></div>
+                </div>
+            </section>
+
+            <!-- Workshop Tab (短剧工坊) -->
+            <section id="workshop" class="tab-content">
+                <div class="panel">
+                    <h2>📖 短剧工坊 <small style="font-size: 0.9rem; color: var(--text-muted);">— 剧本AI延伸剧情 · 人物面孔/声音全剧锁定 · <span id="series-progress-label">下一集: 第 1 集 / 共 10 集</span></small>
+                        <button class="btn btn-small btn-danger" style="margin-left: auto;" onclick="clearSeries()">🗑️ 清除剧本任务</button>
+                    </h2>
+
+                    <div class="settings-section">
+                        <h3>🎞️ 剧集设定 (主提示词)</h3>
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="series-title">📺 剧集名称</label>
+                                <input type="text" id="series-title" placeholder="如：浮桥记">
+                            </div>
+                            <div class="form-group">
+                                <label for="series-genre">🎭 类型/风格</label>
+                                <select id="series-genre">
+                                    <option value="古风奇幻">古风奇幻</option>
+                                    <option value="都市情感">都市情感</option>
+                                    <option value="悬疑推理">悬疑推理</option>
+                                    <option value="科幻未来">科幻未来</option>
+                                    <option value="武侠动作">武侠动作</option>
+                                    <option value="甜宠喜剧">甜宠喜剧</option>
+                                </select>
+                            </div>
+                            <div class="form-group full-width">
+                                <label for="series-premise">🌍 世界观与主线提示词 *</label>
+                                <textarea id="series-premise" rows="3" oninput="generator.syncCharCountFromPremise()" placeholder="描述世界观、主线冲突、主要人物关系。剧本AI将根据这个主提示词延伸每一集的剧情发展，例如：浮空城依靠巨大石桥维系，少女沈桥拥有以歌声续接石桥的秘术，司天官奉命催逼，桥体危机四伏..."></textarea>
+                                <small>剧本AI据此延伸每一集情节点；此提示词是整部剧的种子。人物数默认由此提示词中的人物角色自动识别（可用「人物：沈桥、司天官」这样的写法明确列出）</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="series-ep-count">🔢 每集分镜数</label>
+                                <input type="number" id="series-ep-count" value="4" min="1" max="12">
+                            </div>
+                            <div class="form-group">
+                                <label for="series-total-episodes">🎞️ 总集数</label>
+                                <input type="number" id="series-total-episodes" value="10" min="1" max="100">
+                                <small>"一键生成全剧"将自动生成到该集为止</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="series-scene-duration">⏱️ 默认分镜时长</label>
+                                <input type="number" id="series-scene-duration" min="1" max="60" step="1" value="5">
+                                <span style="font-size:12px;color:var(--text-muted);margin-top:2px;display:block;">匹配模型最大值，支持 1~60 秒</span>
+                            </div>
+                            <div class="form-group">
+                                <label for="series-resolution">📐 分辨率</label>
+                                <select id="series-resolution">
+                                    <option value="480p">480P (快速)</option>
+                                    <option value="720p" selected>720P (标准)</option>
+                                    <option value="1080p">1080P (高清)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="series-ratio">🖼️ 画面比例</label>
+                                <select id="series-ratio">
+                                    <option value="9:16" selected>9:16 (竖屏短剧)</option>
+                                    <option value="16:9">16:9 (横屏)</option>
+                                    <option value="1:1">1:1 (方形)</option>
+                                    <option value="4:3">4:3</option>
+                                    <option value="3:4">3:4</option>
+                                    <option value="21:9">21:9 (宽幅)</option>
+                                </select>
+                                <small>剧本AI会把比例写进每个分镜，提交时参数一致</small>
+                            </div>
+                            <div class="form-group">
+                                <label>🔒 人物一致性锁定</label>
+                                <label style="display: flex; align-items: center; gap: 8px; font-weight: 400;">
+                                    <input type="checkbox" id="series-lock-chars" checked>
+                                    启动生成时自动把人物卡的面孔/声音描述补全进分镜
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>🧬 人物设定卡 <small style="font-size: 0.8rem; color: var(--text-muted);">面孔/声音/服装全剧锁定，保证跨分镜一致性</small></h3>
+                        <div id="characters-list" class="char-list"></div>
+                        <div class="form-actions" style="border: none; padding-top: 12px; margin-top: 8px;">
+                            <button class="btn btn-primary" onclick="generateCharacters()">🧬 AI生成人物设定卡</button>
+                            <span style="display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 0.85rem;">
+                                <label style="display: inline-flex; align-items: center; gap: 4px; font-weight: 400;" title="勾选后: 人物数由「世界观与主线提示词」中的人物角色自动识别 (识别不到时由剧本AI自行判断)；取消勾选可手动指定人数">
+                                    <input type="checkbox" id="series-char-auto" checked onchange="generator.toggleCharCountAuto()">
+                                    按主提示词自动识别
+                                </label>
+                                人物数 <input type="number" id="series-char-count" value="3" min="1" max="8" style="width: 60px; padding: 6px 8px;">
+                            </span>
+                            <button class="btn btn-secondary" onclick="addCharacter()">+ 手动添加人物</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>🎬 本集分镜</h3>
+                        <div id="scenes-list" class="scene-list"></div>
+                        <div class="form-group" style="margin-top: 10px;">
+                            <label for="series-batch-scenes">📋 批量添加情景 <small>(每行一个情景描述，自动并入人物锁定描述，用于快速拼出下一集)</small></label>
+                            <textarea id="series-batch-scenes" rows="3" placeholder="沈桥在桥顶吟唱，石片悬浮旋转&#10;司天官高台点杖，冷声下令&#10;桥体裂纹蔓延，众人惊呼"></textarea>
+                        </div>
+                        <div class="form-actions" style="border: none; padding-top: 12px;">
+                            <button class="btn btn-primary" onclick="generateEpisodeScript()">📝 AI生成本集剧本</button>
+                            <button class="btn btn-secondary" onclick="batchAddScenes()">📋 批量添加情景</button>
+                            <button class="btn btn-secondary" onclick="addScene()">+ 添加分镜</button>
+                        </div>
+                    </div>
+
+                    <div class="form-actions">
+                        <button class="btn btn-primary btn-large" onclick="aiWriteScript()">📝 AI写剧本 (生成分镜剧本)</button>
+                        <button class="btn btn-auto" id="confirm-generate-btn" onclick="confirmAutoGenerate()" disabled>✅ 确认自动生成</button>
+                        <button class="btn btn-secondary" onclick="launchScenes()">▶️ 用当前分镜手动启动</button>
+                        <button class="btn btn-auto" id="auto-all-btn" onclick="autoGenerateAllSeries()">🚀💤 一键生成本剧全部视频 (挂机到完结)</button>
+                        <button class="btn btn-secondary" id="auto-pause-btn" style="display: none;" onclick="toggleAutoPause()">⏸️ 暂停</button>
+                        <button class="btn btn-danger" id="auto-stop-btn" style="display: none;" onclick="stopAutoRun()">⏹️ 停止全剧生成</button>
+                    </div>
+
+                    <!-- 视频合并设置 -->
+                    <div class="settings-section" style="margin-top: 20px;">
+                        <h3>🎬 视频合并设置 <small style="font-size: 0.8rem; color: var(--text-muted);">分镜视频生成完成后自动合并为完整集数视频</small></h3>
+                        <div class="form-group">
+                            <label style="display: flex; align-items: center; gap: 8px; font-weight: 400;">
+                                <input type="checkbox" id="auto-merge-enabled" onchange="toggleAutoMerge(this.checked)">
+                                启用自动合并 (生成完成后自动执行)
+                            </label>
+                            <small>合并后的视频包含 ASR 字幕，保存到对应集数目录</small>
+                        </div>
+                        <div class="form-actions" style="border: none; padding-top: 12px;">
+                            <button class="btn btn-primary" onclick="manualMergeVideos()">📦 手动合并视频 (选择本地文件)</button>
+                            <button class="btn btn-secondary" onclick="manualMergeSelected()">🗂️ 合并已选作品目录</button>
+                        </div>
+                        <small style="color: var(--text-muted);">"手动合并视频"弹窗选择任意本地视频文件，确认后自动合并生成新的完整版；"合并已选作品目录"针对作品库勾选的集数目录。</small>
+                        <!-- 合并进度面板 -->
+                        <div id="merge-progress-panel" style="display: none; margin-top: 14px; background: var(--bg-color); border-radius: var(--radius); padding: 14px 16px;">
+                            <div style="display: flex; justify-content: space-between; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 6px;">
+                                <span id="merge-status-text">准备合并...</span>
+                                <span id="merge-progress-percent">0%</span>
+                            </div>
+                            <div class="progress-bar-mini" style="height: 8px;">
+                                <div class="progress-fill-mini" id="merge-progress-fill" style="width: 0%"></div>
+                            </div>
+                            <div id="merge-detail" style="margin-top: 8px; font-size: 0.8rem; color: var(--text-muted);"></div>
+                        </div>
+                        <div id="merge-status" class="status-message" style="margin-top: 10px;"></div>
+                    </div>
+                    <div id="series-status" class="status-message"></div>
+
+                    <!-- 剧本存档 -->
+                    <div class="settings-section">
+                        <h3>📚 剧本存档 <small style="font-size: 0.8rem; color: var(--text-muted);">保存当前剧本(含人物锁定卡)，以后导入即可延续人物一致性生成续季</small></h3>
+                        <div id="archives-list" class="archive-list"></div>
+                        <div class="form-actions" style="border: none; padding-top: 12px; margin-top: 8px;">
+                            <button class="btn btn-primary" onclick="saveSeriesArchive()">💾 保存当前剧本存档</button>
+                            <button class="btn btn-secondary" onclick="document.getElementById('archive-file-input').click()">📥 导入存档文件</button>
+                            <input type="file" id="archive-file-input" accept=".json,application/json" style="display: none;" onchange="importSeriesArchiveFile(this)">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Gallery Tab -->
+            <section id="gallery" class="tab-content">
+                <div class="panel">
+                    <h2>🖼️ 作品库</h2>
+                    <div id="save-location" style="font-size: 0.85rem; color: var(--text-muted); margin: -10px 0 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;"></div>
+                    <div class="gallery-controls">
+                        <div class="filter-chips">
+                            <span class="chip active" data-filter="all" onclick="setGalleryFilter('all')">全部</span>
+                            <span class="chip" data-filter="pending" onclick="setGalleryFilter('pending')">⏳ 进行中</span>
+                            <span class="chip" data-filter="completed" onclick="setGalleryFilter('completed')">✅ 完成</span>
+                            <span class="chip" data-filter="failed" onclick="setGalleryFilter('failed')">❌ 失败</span>
+                            <span class="chip" data-filter="unknown" onclick="setGalleryFilter('unknown')">❓ 未知</span>
+                        </div>
+                        <div class="search-box">
+                            <input type="text" id="search-input" placeholder="搜索标题..." oninput="filterGallery()">
+                        </div>
+                        <div class="selection-controls">
+                            <label style="display: flex; align-items: center; gap: 6px; font-size: 0.85rem; color: var(--text-muted);">
+                                <input type="checkbox" id="select-all-checkbox" onchange="generator.selectAllCards()"> 全选
+                            </label>
+                            <button class="btn btn-small btn-danger" id="batch-delete-btn" onclick="generator.batchDeleteItems()" disabled>🗑️ 批量删除</button>
+                        </div>
+                        <div class="view-toggle">
+                            <button class="btn btn-small active" data-view="grid" onclick="setView('grid')">▦ 网格</button>
+                            <button class="btn btn-small" data-view="list" onclick="setView('list')">☰ 列表</button>
+                        </div>
+                    </div>
+                    <div class="gallery-grid" id="gallery-grid"></div>
+                </div>
+            </section>
+
+            <!-- Models Tab -->
+            <section id="models" class="tab-content">
+                <div class="panel">
+                    <h2>⚙️ 平台与模型设置</h2>
+
+                    <div class="settings-section">
+                        <h3>🔌 平台接入</h3>
+
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="platform-preset">🏢 平台预设</label>
+                                <select id="platform-preset" onchange="onPlatformPresetChange()">
+                                    <option value="auto">自动识别 (推荐)</option>
+                                    <option value="ark">火山方舟 (豆包 Seedance)</option>
+                                    <option value="openai">OpenAI 兼容 (/videos)</option>
+                                    <option value="custom">完全自定义 JSON</option>
+                                </select>
+                                <small id="platform-hint">根据端点地址与模型名自动识别平台</small>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="api-endpoint">🌐 API 端点</label>
+                                <input type="text" id="api-endpoint" placeholder="https://api.example.com/v1">
+                                <small>方舟填 https://ark.cn-beijing.volces.com/api/v3 (可只填主机名)</small>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="api-key">🔑 API 密钥</label>
+                                <input type="password" id="api-key" placeholder="填入平台 API Key">
+                                <small>仅保存在本机浏览器 localStorage</small>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="model-name">🤖 模型 ID</label>
+                                <input type="text" id="model-name" list="model-options" placeholder="手动输入或从下方列表选择">
+                                <datalist id="model-options"></datalist>
+                                <small>可点击下方"拉取模型列表"后选择，或直接输入任意自定义模型 ID<br>
+                                ⚠️ AGNES v2.0 系模型固定输出 5 秒/4:3（时长与比例参数不生效）；需要 8/12 秒竖屏请选 agnes-video-2.5-flash 或火山方舟 Seedance</small>
+                            </div>
+                        </div>
+
+                        <div class="form-group" id="custom-json-group" style="display: none;">
+                            <label for="custom-json">📝 自定义请求体 JSON 模板</label>
+                            <textarea id="custom-json" rows="6" placeholder='{
+  "model": "{{model}}",
+  "prompt": "{{prompt}}",
+  "duration": {{duration}},
+  "resolution": "{{resolution}}"
+}'></textarea>
+                            <div class="form-grid" style="margin-top: 10px;">
+                                <div class="form-group">
+                                    <label for="custom-poll-path">🔄 轮询查询路径 (含 {id})</label>
+                                    <input type="text" id="custom-poll-path" placeholder="/videos/{id}">
+                                </div>
+                                <div class="form-group">
+                                    <label for="custom-result-path">📤 视频地址取值路径</label>
+                                    <input type="text" id="custom-result-path" placeholder="content.video_url">
+                                </div>
+                            </div>
+                            <small>提交固定请求 POST {端点}/videos，查询路径与结果路径可按平台文档自定义</small>
+                        </div>
+
+                        <div class="form-actions" style="border: none; padding-top: 10px; margin-top: 10px;">
+                            <button class="btn btn-primary" onclick="saveModelSettings()">💾 保存设置</button>
+                            <button class="btn btn-secondary" onclick="testConnection()">🔗 测试连接</button>
+                            <button class="btn btn-secondary" onclick="fetchModels()">🔍 拉取模型列表</button>
+                            <button class="btn btn-danger" onclick="resetSettings()">🔄 恢复默认</button>
+                        </div>
+                        <div id="settings-status" class="status-message"></div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>🧩 模型发现</h3>
+                        <p style="color: var(--text-muted); margin-bottom: 12px; font-size: 0.9rem;">拉取平台可用模型列表，点击模型名即可选用；列表为空的平台可手动输入模型 ID。</p>
+                        <div id="models-list" style="max-height: 320px; overflow-y: auto;"></div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>✍️ 剧本AI (文本模型)</h3>
+                        <p style="color: var(--text-muted); margin-bottom: 12px; font-size: 0.9rem;">专用于"短剧工坊"的文本模型：根据主提示词延伸每集剧情，并维护人物面孔/声音一致性。使用 OpenAI 兼容 /chat/completions 接口（火山方舟同样兼容）。</p>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="llm-same-creds" checked onchange="generator.onLlmSameCredsChange()">
+                                与视频平台使用相同端点和密钥
+                            </label>
+                        </div>
+                        <div class="form-grid" style="margin-top: 10px;">
+                            <div class="form-group">
+                                <label for="llm-endpoint">文本模型端点</label>
+                                <input type="text" id="llm-endpoint" onchange="generator.onLlmCredsChange()" placeholder="https://api.example.com/v1">
+                            </div>
+                            <div class="form-group">
+                                <label for="llm-key">文本模型密钥</label>
+                                <input type="password" id="llm-key" onchange="generator.onLlmCredsChange()" placeholder="">
+                            </div>
+                            <div class="form-group full-width">
+                                <label for="llm-model">文本模型 ID <small>(下拉选择写剧本用的模型)</small></label>
+                                <div style="display: flex; gap: 8px; align-items: center;">
+                                    <select id="llm-model" style="flex: 1;" onchange="generator.onLlmModelChange()"></select>
+                                    <button class="btn btn-small btn-secondary" type="button" onclick="generator.refreshLlmModels()">🔄 拉取模型</button>
+                                </div>
+                                <input type="text" id="llm-model-manual" style="margin-top: 6px; display: none;" onchange="generator.onLlmModelChange()" placeholder="手动输入模型 ID（端点不提供 /models 接口时使用）">
+                                <small id="llm-model-hint">勾选上方选项时，下拉框列出「平台接入」拉取到的模型；取消勾选并填写文本模型端点/密钥后，下拉框自动列出该端点的全部模型</small>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>🎲 高级参数</h3>                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="seed">🎲 种子值 (可选，方舟支持)</label>
+                                <input type="number" id="seed" placeholder="留空则随机">
+                            </div>
+                            <div class="form-group">
+                                <label for="submit-interval">⏳ 提交间隔 (秒)</label>
+                                <input type="number" id="submit-interval" value="2" min="0" max="120" step="0.5">
+                                <small>批量任务相邻提交的最小间隔。免费平台限流(429)时请调大，如 10~30 秒；触发限流时会自动重试并加倍此间隔</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="base-path">🗂️ 保存位置</label>
+                                <input type="text" id="base-path" placeholder="服务器运行目录下的 output">
+                                <div style="display: flex; gap: 8px; align-items: center; margin-top: 6px;">
+                                    <button class="btn btn-small btn-secondary" onclick="changeOutputDir()">📂 更改保存位置</button>
+                                    <small>生成完成的作品保存到此目录 (立即生效, 重启保留)</small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- History Tab -->
+            <section id="history" class="tab-content">
+                <div class="panel">
+                    <h2>📋 生成历史</h2>
+                    <div class="history-filters">
+                        <select id="filter-type" onchange="filterHistory()">
+                            <option value="all">全部类型</option>
+                            <option value="video">仅视频</option>
+                            <option value="image">仅图片</option>
+                        </select>
+                        <input type="date" id="filter-date" onchange="filterHistory()">
+                        <button class="btn btn-secondary" onclick="clearHistory()">🗑️ 清空历史</button>
+                    </div>
+                    <div class="history-list" id="history-list"></div>
+                </div>
+            </section>
+
+            <!-- Update Tab (版本更新: 无新版本时入口隐藏) -->
+            <section id="update" class="tab-content">
+                <div class="panel">
+                    <h2>🔄 版本更新</h2>
+                    <div id="update-body"></div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>晨曦短剧梦工坊 | 多平台批量视频制作工具</p>
+            <p id="connection-status">状态: 检测中...</p>
+           <p><a href="javascript:void(0)" onclick="showVersionInfo()" title="点击查看本版本功能介绍" style="color: var(--primary-color); font-weight: 600;">v<span id="footer-version">2.6.0</span></a> · 2026 @ 晨曦微光工作室 </p>
+        </footer>
+    </div>
+
+    <!-- Modal -->
+    <div id="modal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="generator.closeModal()">&times;</span>
+            <div id="modal-body"></div>
+        </div>
+    </div>
+
+    <!-- Confirm Dialog (应用内确认对话框) -->
+    <div id="confirm-modal" class="modal">
+        <div class="modal-content confirm-box">
+            <h3 id="confirm-title" style="margin: 0;">确认操作</h3>
+            <div id="confirm-message" class="confirm-message"></div>
+            <div id="confirm-input-wrap" style="display: none; margin-top: 12px;">
+                <label id="confirm-input-label" style="font-size: 0.85rem; color: var(--text-muted); display: block; margin-bottom: 6px;"></label>
+                <input type="text" id="confirm-input" style="width: 100%;">
+            </div>
+            <div class="modal-actions" style="border: none; padding-top: 6px; margin-top: 6px;">
+                <button class="btn btn-primary" id="confirm-ok-btn">确定</button>
+                <button class="btn btn-secondary" id="confirm-cancel-btn">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 桌面应用模式 (Electron): 显示无边框标题栏并绑定窗口控制
+        if (window.electronAPI && window.electronAPI.desktop) {
+            const tb = document.getElementById('desktop-titlebar');
+            if (tb) tb.style.display = 'flex';
+            document.body.classList.add('desktop-mode');
+            const q = (id) => document.getElementById(id);
+            if (q('dtb-min')) q('dtb-min').onclick = () => electronAPI.minimize();
+            if (q('dtb-max')) q('dtb-max').onclick = () => electronAPI.maximize();
+            if (q('dtb-close')) q('dtb-close').onclick = () => electronAPI.close();
+            electronAPI.onWindowState((max) => { if (q('dtb-max')) q('dtb-max').textContent = max ? '❐' : '□'; });
+        }
+    </script>
+    <script src="api-client.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

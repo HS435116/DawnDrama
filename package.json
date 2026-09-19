@@ -1,0 +1,126 @@
+{
+  "name": "agnes-2.5-video-generator",
+  "version": "2.8.1",
+  "description": "晨曦短剧梦工坊 - 多平台AI短剧批量制作工具",
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tests/run-all.js",
+    "test:gallery": "node tests/gallery-selection.test.js",
+    "test:series": "node tests/series-cast.test.js",
+    "test:llm": "node tests/llm-model-select.test.js",
+    "test:port": "node tests/port-lifecycle.test.js",
+    "test:busy": "node tests/platform-busy.test.js",
+    "test:cancel": "node tests/cancel.test.js",
+    "test:status": "node tests/status-and-save.test.js",
+    "test:conn": "node tests/server-connection.test.js",
+    "test:detail": "node tests/task-detail.test.js",
+    "test:attention": "node tests/attention.test.js",
+    "test:resume": "node tests/resume-recovery.test.js",
+    "test:retryui": "node tests/retry-visibility.test.js",
+    "test:net": "node tests/network-failures.test.js",
+    "test:dl": "node tests/download-segments.test.js",
+    "dev": "nodemon server.js",
+    "free-port": "node free-port.js 3000",
+    "package": "pkg . --out-path dist",
+    "package:win": "pkg . --targets node22-win-x64 --out-path dist",
+    "package:linux": "pkg . --targets node22-linux-x64 --out-path dist",
+    "package:macos": "pkg . --targets node22-macos-arm64 --out-path dist",
+    "desktop": "electron .",
+    "desktop:build": "electron-builder --win portable nsis"
+  },
+  "keywords": [
+    "video",
+    "generation",
+    "agnes",
+    "batch",
+    "ai"
+  ],
+  "author": "晨曦微光工作室 (Morninglight Studio)",
+  "license": "MIT",
+  "dependencies": {
+    "base64-url": "^2.3.3",
+    "cors": "^2.8.5",
+    "express": "^4.22.2",
+    "level": "^10.0.0",
+    "level-js": "^6.1.0"
+  },
+  "devDependencies": {
+    "@yao-pkg/pkg": "^6.22.0",
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3",
+    "nodemon": "^3.0.1",
+    "png-to-ico": "^3.0.2"
+  },
+  "bin": {
+    "agnes-video-generator": "./server.js"
+  },
+  "pkg": {
+    "assets": [
+      "index.html",
+      "app.js",
+      "api-client.js",
+      "styles.css",
+      "LICENSE",
+      "README.md"
+    ],
+    "targets": [
+      "node22-win-x64",
+      "node22-linux-x64",
+      "node22-macos-arm64"
+    ],
+    "outputPath": "dist"
+  },
+  "build": {
+    "appId": "studio.morninglight.chenxi-dreamworks",
+    "productName": "晨曦短剧梦工坊",
+    "directories": {
+      "output": "desktop-dist"
+    },
+    "files": [
+      "electron-main.js",
+      "electron-preload.js",
+      "electron-process-video.js",
+      "server.js",
+      "port-utils.js",
+      "free-port.js",
+      "merge_videos.py",
+      "index.html",
+      "app.js",
+      "api-client.js",
+      "styles.css",
+      "assets/**",
+      "latest.json",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources",
+        "to": "resources",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "icon": "assets/logo.ico",
+      "target": [
+        {
+          "target": "portable"
+        },
+        {
+          "target": "nsis"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "artifactName": "晨曦短剧梦工坊-安装版-v${version}.${ext}",
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "晨曦短剧梦工坊-v${version}-便携版.${ext}"
+    }
+  }
+}
