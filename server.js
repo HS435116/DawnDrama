@@ -161,10 +161,16 @@ app.get('/api/health', (req, res) => {
 // ================= 启动/关闭上报 =================
 // 仅上报启动和关闭事件，统计用户数、版本分布；无其他行为追踪
 const REPORT_ON = process.env.AGNES_REPORT_OFF ? false : true;
+// 持久化用户ID: 首次启动生成UUID, 后续复用
+const USER_ID_FILE = path.join(process.cwd(), '.dawn-drama-uid.json');
+let _userId = null;
+try { _userId = JSON.parse(fs.readFileSync(USER_ID_FILE, 'utf8')).id; } catch (_) {}
+if (!_userId) { _userId = require('crypto').randomUUID(); try { fs.writeFileSync(USER_ID_FILE, JSON.stringify({ id: _userId, created: new Date().toISOString() })); } catch (_) {} }
+
 function reportEvent(name) {
     if (!REPORT_ON) return;
     try {
-        const body = JSON.stringify({ name, data: { version: APP_VERSION, os: process.platform, browser: 'Electron' } });
+        const body = JSON.stringify({ name, data: { uid: _userId, version: APP_VERSION, os: process.platform, browser: 'Electron' } });
         const url = new URL('http://78oq264463tb.vicp.fun/api/collect');
         const opts = { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }, timeout: 3000 };
         const req = require('http').request(url, opts, res => res.resume());
