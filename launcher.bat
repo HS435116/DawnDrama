@@ -53,7 +53,7 @@ if %errorlevel% neq 0 (
     pause
     goto menu
 )
-call node start-server.bat
+call start-server.bat
 goto menu
 
 :browser

@@ -120,8 +120,8 @@ npm install
 # 3. 打包
 npm run desktop:build
 # 产物在 desktop-dist/：
-#   晨曦短剧梦工坊-v2.7.0-便携版.exe
-#   晨曦短剧梦工坊-v2.7.0-安装版.exe
+#   晨曦短剧梦工坊-v2.8.1-便携版.exe
+#   晨曦短剧梦工坊-v2.8.1-安装版.exe
 ```
 
 **便携模式资源路径：**
@@ -154,7 +154,7 @@ npm run desktop:build
 ├── electron-main.js         Electron 桌面版主进程
 ├── electron-preload.js      Electron 预加载桥
 ├── styles.css               样式
-├── package.json             项目配置（v2.7.0）
+├── package.json             项目配置（v2.8.1）
 ├── latest.json              版本更新清单
 ├── assets/                  图标资源
 ├── output/                  生成结果（不推送, gitignore）
