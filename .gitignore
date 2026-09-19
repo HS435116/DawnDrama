@@ -2,29 +2,23 @@
 node_modules/
 
 # ============ 本地生成数据 (不推送) ============
-# 生成的视频 / 图片 / 作品库数据
 output/
-# 用户本地设置
 agnes-settings.json
-# 保存位置配置 (每台机器各不相同, 由应用运行时自动生成)
 agnes-data-dir.json
 
 # ============ 密钥与本地数据导出 (绝对不要推送) ============
-# 从浏览器 LevelDB / 缓存导出的原始数据: 内含平台 API 密钥与个人创作数据
 agnes_*_raw.bin
 agnes_*_dump.json
 *.bin
 dump_*.js
-# 个人密钥文件 (如 .env / 密钥清单), 请改用环境变量 AGNES_API_KEY
 .env
 .env.*
 *_secrets.json
 secrets.json
 
-# ============ 构建产物 (不推送, 可由 npm run desktop:build 重建) ============
+# ============ 构建产物 (不推送) ============
 desktop-dist/
 dist/
-# 便携模式资源包 (Python运行时/ffmpeg/ASR模型, 约500MB, 打包前需本地准备, 见 README)
 resources/
 
 # ============ Python 缓存 ============
@@ -32,13 +26,10 @@ __pycache__/
 *.pyc
 *.pyo
 
-# ============ 本地回归测试 (开发者本地保留, 不随仓库发布) ============
+# ============ 本地回归测试 (开发者本地保留) ============
 tests/
 
 # ============ 系统临时文件 ============
-nul
-*.log
-test/*.log
 .DS_Store
 Thumbs.db
 
@@ -54,3 +45,6 @@ Thumbs.db
 # ============ 一次性本地脚本 (含个人剧集内容/本机绝对路径, 不推送) ============
 recover_*.py
 gen_scenes_*.py
+
+# ============ 本地分析服务 (不随仓库发布) ============
+analytics-server/

@@ -23,7 +23,7 @@ const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 const { reclaimStaleInstance, waitPortFree, listeningPids, commandLine, isOurServer } = require('./port-utils');
 
-const APP_VERSION = '2.8.1';
+const APP_VERSION = '2.8.2';
 
 const app = express();
 const PORT = parseInt(process.env.PORT) || 3000;
@@ -157,6 +157,23 @@ app.get('/api/health', (req, res) => {
 // 输出目录优先级: 环境变量 AGNES_OUTPUT_DIR > 用户设置文件 (agnes-data-dir.json) > 运行目录下 output/
 // 该目录是全局唯一的保存根: 所有视频/图片都保存到 <basePath>/video|images/<标题>/ 下,
 // 不再存在任何写死在代码里的备用目录。
+
+// ================= 启动/关闭上报 =================
+// 仅上报启动和关闭事件，统计用户数、版本分布；无其他行为追踪
+const REPORT_ON = process.env.AGNES_REPORT_OFF ? false : true;
+function reportEvent(name) {
+    if (!REPORT_ON) return;
+    try {
+        const body = JSON.stringify({ name, data: { version: APP_VERSION, os: process.platform, browser: 'Electron' } });
+        const url = new URL('http://78oq264463tb.vicp.fun/api/collect');
+        const opts = { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }, timeout: 3000 };
+        const req = require('http').request(url, opts, res => res.resume());
+        req.on('error', () => {});
+        req.write(body);
+        req.end();
+    } catch (_) {}
+}
+setTimeout(() => reportEvent('app.start'), 2000);
 const DATA_DIR_FILE = path.join(process.cwd(), 'agnes-data-dir.json');
 
 const IMAGES_FOLDER = 'images';
@@ -981,6 +998,7 @@ function gracefulShutdown(signal) {
     shuttingDown = true;
 
     console.log(`\n🛑 正在关闭服务器 (${signal})...`);
+    reportEvent('app.close');
 
     if (!server || !server.listening) {
         console.log('服务器未运行，直接退出');
