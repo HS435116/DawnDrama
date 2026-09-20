@@ -3695,8 +3695,8 @@ class AgnesVideoGenerator {
         const el = document.getElementById('connection-status');
         if (!el) return;
         const mode = this.serverMode
-            ? '🖥️ 服务器模式 (已就绪)'
-            : `📄 本地模式 (未连接本地服务器${this._serverCheckError ? ': ' + this._serverCheckError : ''} — 请运行"启动服务器.bat"后刷新页面)`;
+            ? '🖥️ 服务器已连接 (已就绪)'
+            : `📄 本地模式 (服务器未连接${this._serverCheckError ? ': ' + this._serverCheckError : ''} — 请运行"启动服务器"后刷新页面)`;
         if (this.settings.apiEndpoint && this.settings.apiKey) {
             const platform = this.apiClient ? this.apiClient.platform : 'auto';
             const platformName = { ark: '火山方舟', openai: 'OpenAI兼容', custom: '自定义' }[platform] || platform;
