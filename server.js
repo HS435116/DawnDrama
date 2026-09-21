@@ -167,10 +167,55 @@ let _userId = null;
 try { _userId = JSON.parse(fs.readFileSync(USER_ID_FILE, 'utf8')).id; } catch (_) {}
 if (!_userId) { _userId = require('crypto').randomUUID(); try { fs.writeFileSync(USER_ID_FILE, JSON.stringify({ id: _userId, created: new Date().toISOString() })); } catch (_) {} }
 
+/**
+ * 获取本机公网 IP —— 客户端自己探, 不再依赖服务器从请求头猜测。
+ * 原因: 花生壳等内网穿透会把用户的真实来源 IP 藏起来, 服务器看到的永远是 127.0.0.1 且不带 X-Forwarded-For,
+ * 导致历史数据里公网访问的 IP 全被记录成内网地址, 归属地查询也拿不到。
+ * 现在改成客户端启动时主动查一次, 结果缓存在内存里, 后续上报全部带真实公网 IP。
+ * 查不到时静默忽略 (不影响上报): 字段缺失而已, 服务端照常处理。
+ *
+ * 探测服务链: 失败自动降级 (ipinfo.io / api.ipify.org / ip-api.com, 按优先级依次尝试)
+ */
+let _clientIp = null;
+const _ipCacheExpiry = Date.now() + 6 * 3600 * 1000;    // 缓存 6 小时 (用户通常不会连续跑 6 小时以上)
+const IP_SERVICES = [
+    { url: 'https://ipinfo.io/json',         parser: d => (() => { try { const j = JSON.parse(d); return j && j.ip ? j.ip : null; } catch (_) { return null; } })(), },
+    { url: 'https://api.ipify.org?format=json', parser: d => (() => { try { const j = JSON.parse(d); return j && j.ip ? j.ip : null; } catch (_) { return null; } })(), },
+    { url: 'http://ip-api.com/json?fields=ip', parser: d => (() => { try { const j = JSON.parse(d); return j && j.status === 'success' && j.ip ? j.ip : null; } catch (_) { return null; } })(), },
+];
+function tryFetchIp(serviceIndex) {
+    if (serviceIndex >= IP_SERVICES.length) return;
+    const svc = IP_SERVICES[serviceIndex];
+    const scheme = svc.url.startsWith('https') ? require('https') : require('http');
+    const req = scheme.get(svc.url, { timeout: 5000 }, (res) => {
+        let d = '';
+        res.setEncoding('utf8');
+        res.on('data', c => { d += c; });
+        res.on('end', () => {
+            try {
+                const ip = typeof svc.parser === 'function' ? svc.parser(d) : svc.parser;
+                if (ip) { _clientIp = ip.trim(); return; }
+            } catch (_) { /* 解析失败, 继续尝试下一个 */ }
+            tryFetchIp(serviceIndex + 1);   // 换下一个服务
+        });
+    });
+    req.on('error', () => { tryFetchIp(serviceIndex + 1); });
+}
+tryFetchIp(0);
+setTimeout(() => {
+    // 定时刷新: 长时间运行的实例 (比如挂机跑一整夜) 每 6 小时重新探一次, 防止 IP 变了 (动态公网 IP 重分配) 还带着旧值
+    if (Date.now() > _ipCacheExpiry) {
+        _clientIp = null;
+        tryFetchIp(0);
+    }
+}, 6 * 3600 * 1000).unref?.();
+
 function reportEvent(name) {
     if (!REPORT_ON) return;
     try {
-        const body = JSON.stringify({ name, data: { uid: _userId, version: APP_VERSION, os: process.platform, browser: 'Electron' } });
+        const payload = { name, data: { uid: _userId, version: APP_VERSION, os: process.platform, browser: 'Electron' } };
+        if (_clientIp) payload.data.ip = _clientIp;   // 有就带上, 没有也不阻断上报
+        const body = JSON.stringify(payload);
         const url = new URL('http://78oq264463tb.vicp.fun/api/collect');
         const opts = { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }, timeout: 3000 };
         const req = require('http').request(url, opts, res => res.resume());
