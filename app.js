@@ -70,6 +70,13 @@ class AgnesVideoGenerator {
         this._llmModelsFetchedAt = 0;   // 拉取时间 (5 分钟内不重复拉)
         this._llmFetching = false;      // 正在拉取中 (防止并发重复请求)
 
+        // 网络状态与"挂机等网络"的等待者
+        this._online = (typeof navigator === 'undefined' || navigator.onLine !== false);
+
+        this._mergeChecked = new Set(); // 本会话已检查过"该集是否该合并"的集名 (避免重复弹窗)
+        this._mergePrompts = new Set(); // 已提示过"分镜已齐, 要不要合并"的集名
+        this._autoLoopActive = false;   // 挂机 for 循环是否真的在跑 (与 _autoRunning 区分: 暂停态/恢复态可能只有状态没有循环)
+
         // 保存根目录的唯一来源: 服务器 /api/health 返回的 outputDir (即"模型设置 → 保存位置")。
         // 此处不写死任何盘符/目录, 避免与用户自定义路径产生分歧。
         this.serverOutputDir = null;
@@ -107,6 +114,10 @@ class AgnesVideoGenerator {
 
         // 同步自动合并复选框状态
         this._syncAutoMergeUI();
+
+        // 按上次留下的挂机痕迹接着跑 (刷新/断网/关页面都不该让任务凭空消失;
+        // 只有用户点过"⏹️ 停止全剧生成"才会清掉痕迹)
+        this.resumeAutoRunOnLoad();
     }
 
     /* ================= 服务器模式检测 ================= */
@@ -247,6 +258,13 @@ class AgnesVideoGenerator {
             const el = document.getElementById(id);
             if (el) el.addEventListener('change', () => this.saveSettings());
         });
+
+        // 断网/重连感知: 挂机时不希望一次网络抖动就把整轮任务丢掉,
+        // 也不希望用户不知道"网络断了正在等"。两个事件都在这里统一处理。
+        window.addEventListener('online', () => this.onNetworkChange(true));
+        window.addEventListener('offline', () => this.onNetworkChange(false));
+        // 关页面前把挂机状态落盘 (正常关闭也会走这里; 刷新同理) —— 只落盘, 不停止
+        window.addEventListener('beforeunload', () => { this.saveRunState({}); });
     }
 
     switchTab(tabId) {
@@ -1052,6 +1070,34 @@ class AgnesVideoGenerator {
 
         this.saveHistory();
         this.renderGallery();
+        // 这一格落盘后, 这一集很可能刚齐: 顺手检查并出成片。
+        // 覆盖"扫描找回 / 未保存重新下载 / 单条重试 / 刷新后自动轮询"这几条没有合并钩子的路径 ——
+        // 以前它们只把片段写回作品库, 用户看到"片段齐了却永远没有成片"。
+        this._checkEpisodeReadyAfterSave(record);
+    }
+
+    /**
+     * 记录落盘后检查"这一集是不是齐了" → 齐了就补出成片。
+     * 只做检查与提示/合并, 不阻塞调用方 (生成进度不应被 1 分钟的合并卡住)。
+     */
+    _checkEpisodeReadyAfterSave(record) {
+        try {
+            if (!record || !record.path || !record.title) return;
+            if (!this.serverMode && !window.electronAPI) return;
+            if (!this._mergeChecked) this._mergeChecked = new Set();
+            const ep = this.episodeByTitle(record.title);
+            if (!ep || !ep.scenes.length) return;
+            if (this._mergeChecked.has(record.title)) return;   // 本会话已处理过这一集
+            if (this._postRunning || this._mergeRunning) return; // 正在合并, 别插队
+            const prog = this.episodeSceneProgress(ep);
+            if (prog.pending.length || prog.unsaved.length || prog.total === 0) return;
+            this.ensureEpisodeMerged(record.title).catch(e => {
+                console.warn(`片段齐了但自动合并失败 (${record.title}):`, e.message);
+                this.showStatus(`⚠️ ${record.title} 分镜已齐，但合并失败: ${e.message}，可点"📦 手动合并视频"重试`, 'warning');
+            });
+        } catch (e) {
+            console.warn('检查本集是否可合并时出错:', e.message);
+        }
     }
 
     /**
@@ -1621,31 +1667,90 @@ class AgnesVideoGenerator {
     }
 
     /**
-     * 补全取回后按集合并 (只处理"分镜已齐"的集; 未开启自动合并时给出提示)。
+     * 补全取回后按集合并 (只处理"分镜已齐"的集; 未开启自动合并时改成一键提示)。
      * @param {string[]} titles 本次有片段被找回的集名
      */
     async mergeRecoveredEpisodes(titles) {
-        let merged = 0, incomplete = 0, disabled = 0, notFound = 0;
+        let merged = 0, incomplete = 0, prompted = 0, notFound = 0;
         for (const title of titles) {
             try {
-                const r = await this.maybeAutoMergeEpisode(title);
-                if (r === 'merged') { merged++; this.showStatus(`🎬 ${title}：分镜已补齐，已自动合并成片`, 'success'); }
+                const r = await this.ensureEpisodeMerged(title);
+                if (r === 'merged') { merged++; this.renderGallery(); }
                 else if (r === 'incomplete') incomplete++;
-                else if (r === 'disabled') disabled++;
+                else if (r === 'prompted') prompted++;
                 else notFound++;
             } catch (e) {
                 console.warn(`补全后自动合并失败 (${title}):`, e.message);
-                this.showStatus(`⚠️ ${title}：分镜已补齐，但自动合并失败: ${e.message}，可在"短剧工坊 → 手动合并视频"重试`, 'warning');
+                this.showStatus(`⚠️ ${title}：分镜已补齐，但合并失败: ${e.message}，可在"短剧工坊 → 手动合并视频"重试`, 'warning');
             }
         }
-        if (merged) this.renderGallery();
-        // 未开启自动合并 / 还没齐: 明确告诉用户下一步, 避免"找不到成片"
-        if (disabled && !merged) {
-            this.showStatus(`💡 已补全取回视频。如需自动合成整集，请在"短剧工坊 → 视频合并设置"勾选「启用自动合并」，或点"📦 手动合并视频"`, 'info');
-        } else if (incomplete) {
+        // 还没齐: 明确告诉用户下一步, 避免"找不到成片"
+        if (incomplete) {
             this.showStatus(`💡 有 ${incomplete} 集尚未补齐全部分镜，补齐后会自动合并（也可随时点"📦 手动合并视频"）`, 'info');
+        } else if (prompted && !merged) {
+            this.showStatus('💡 分镜已齐，但「启用自动合并」没勾选，所以没有自动合成。已弹出提示，可一键合并', 'info');
         }
     }
+
+    /**
+     * 保证这一集真的有成片 (分镜齐了就必须产出 <集名>_完整版.mp4)。
+     * 所有"片段刚补齐"的路径都应该走这里: 扫描找回、挂机续跑、断线重连后的自动重试。
+     *
+     * 三种结果:
+     *   merged    —— 已合成, 且服务端确认生成了成片文件
+     *   prompted  —— 未勾选「启用自动合并」: 弹一键提示, 不擅自烧 CPU, 更不谎报成功
+     *   skipped   —— 服务端模式不可用/该集不在剧本里
+     * 失败会抛错 (调用方决定怎么提示), 绝不 `return` 一个假成功。
+     * @returns {Promise<'merged'|'prompted'|'incomplete'|'skipped'|'missing'>}
+     */
+    async ensureEpisodeMerged(title) {
+        if (!title) return 'skipped';
+        if (!this.serverMode && !window.electronAPI) return 'skipped';
+        if (!this._mergeChecked) this._mergeChecked = new Set();   // 兼容测试里只造了部分实例的情况
+        const ep = this.episodeByTitle(title);
+        if (!ep || !ep.scenes.length) return 'missing';
+        const prog = this.episodeSceneProgress(ep);
+        if (prog.pending.length || prog.unsaved.length || prog.total === 0) return 'incomplete';
+        // 已经合成过就不重复烧一遍 (同一会话内按集名 + 成片是否已落盘判断)
+        if (this._mergeChecked.has(title)) return 'skipped';
+        if (localStorage.getItem('autoMergeEnabled') !== 'true') {
+            // 不擅自合并, 但也绝不默默什么都不做 —— 给个一键提示
+            this._mergeChecked.add(title);
+            this.notifyAttention({
+                key: `merge-prompt:${title}`,
+                title: `${title} 分镜已齐，要现在合成整集吗？`,
+                message: `这一集 ${prog.done}/${prog.total} 个片段都已保存到本地，但「启用自动合并」没有勾选，所以没有自动合成。\n\n`
+                    + '点下面按钮可立即合成（含音频识别 + 中文字幕烧录，约 1 分钟，不消耗平台配额）。\n'
+                    + '也可以到"短剧工坊 → 视频合并设置"勾上「启用自动合并」，以后就自动完成。',
+                level: 'warning',
+                tab: 'workshop',
+                actions: [
+                    { text: '🎬 立即合并成片', cls: 'btn-primary', run: () => this.mergeEpisodeNow(title) },
+                    { text: '📦 稍后手动合并', cls: 'btn-secondary', run: () => this.switchTab('workshop') },
+                ],
+            });
+            return 'prompted';
+        }
+        this._mergeChecked.add(title);
+        const relPath = await this.autoMergeAfterGeneration(title, { force: true, showProgress: true });
+        if (!relPath) throw new Error('合并没有产出成片 (未返回成片路径)');
+        this.renderGallery();
+        return 'merged';
+    }
+
+    /** 提醒里那一键合并: 走同一套合并流程, 结果照样如实反馈 */
+    async mergeEpisodeNow(title) {
+        this.closeModal();
+        this._mergeChecked.add(title);
+        try {
+            const relPath = await this.autoMergeAfterGeneration(title, { force: true, showProgress: true });
+            if (!relPath) throw new Error('合并没有产出成片 (未返回成片路径)');
+            this.renderGallery();
+        } catch (e) {
+            this.showStatus(`❌ ${title} 合并失败: ${e.message}`, 'error');
+        }
+    }
+
     /**
      * 按作品标题找回对应的剧集 (含尚未归档的"当前分镜")。
      * 合并需要用它判断"这一集的分镜是否已经齐了"。
@@ -1664,21 +1769,13 @@ class AgnesVideoGenerator {
     }
 
     /**
-     * 某集的分镜补齐后自动合并成片。
-     * 场景: 断网重连后用"任务扫描"把视频找回来了, 或挂机续跑把缺的片段补下载回来了 ——
-     * 这两条路径以前只负责把片段落盘、不做合并, 用户看到的就是"视频都回来了却没有成片"。
-     * @returns {Promise<'merged'|'incomplete'|'disabled'|'not-found'>}
+     * 某集的分镜补齐后自动合并成片 (兼容旧调用: 内部统一走 ensureEpisodeMerged)。
+     * 以前它在"未勾选自动合并"时返回 'disabled', 在合并完却拿不到成片路径时**照样返回 'merged'** ——
+     * 后者就是"假成功"的来源之一, 现在只有真的产出成片才算 merged。
+     * @returns {Promise<'merged'|'incomplete'|'prompted'|'skipped'|'missing'>}
      */
     async maybeAutoMergeEpisode(title) {
-        if (!this.serverMode) return 'disabled';
-        if (localStorage.getItem('autoMergeEnabled') !== 'true') return 'disabled';
-        const ep = this.episodeByTitle(title);
-        if (!ep || !ep.scenes.length) return 'not-found';
-        const prog = this.episodeSceneProgress(ep);
-        if (prog.pending.length || prog.unsaved.length || prog.total === 0) return 'incomplete';
-        // 分镜已全部落盘: 与批量生成结束后一样, 执行"音频识别 + 字幕烧录 + 合并成片"
-        await this.autoMergeAfterGeneration(title, { force: true, showProgress: true });
-        return 'merged';
+        return this.ensureEpisodeMerged(title);
     }
 
     /* ================= 未完成任务找回 (刷新页面 / 断网重连后) ================= */
@@ -2775,24 +2872,52 @@ class AgnesVideoGenerator {
                 absEpisodeDir = base + (rel.startsWith('/') || rel.startsWith('\\') ? '' : '/') + rel;
             }
             let relPath = null;
+            let subInfo = null;      // 字幕到底烧成功没有: 脚本会如实回报, 别再无脑说"已烧录"
+            let subReason = '';      // 没烧上的原因 (由合并脚本给出)
             if (window.electronAPI) {
                 if (showProgress) this._setPostProgress(3, `🎬 准备处理分镜片段`, `保存位置: ${absEpisodeDir}`);
                 const result = await window.electronAPI.mergeEpisode(absEpisodeDir, onStage);
                 if (!result.success) throw new Error(result.error || '合并失败');
-                this.showStatus(`✅ 合并成功: ${episodeName}`, 'success');
                 relPath = this._toRelOutputPath(result.result.finalVideoPath);
+                subInfo = result.result.subtitles;
+                subReason = result.result.subtitleReason || '';
             } else {
                 // 服务器模式: 调用后端合并接口 (需服务器本机有 python + ffmpeg)
                 // stream=1 时后端以 NDJSON 逐行推送阶段事件, 用于实时显示 ASR/字幕烧录进度
                 const relDir = `${this.getEpisodeFolder()}/${this.sanitizeFilename(episodeName)}`;
                 if (showProgress) this._setPostProgress(3, `🎬 准备处理分镜片段`, `保存位置: ${absEpisodeDir}`);
                 const data = await this._mergeEpisodeViaServer(relDir, onStage);
-                this.showStatus(`✅ 合并成功: ${episodeName}`, 'success');
                 relPath = this._toRelOutputPath(data.finalVideoPath);
+                subInfo = data.subtitles;
+                subReason = data.subtitleReason || '';
             }
+            if (!relPath) throw new Error('合并没有产出成片 (服务器未返回成片路径)');
 
+            // 字幕到底烧上没有: true/false 来自合并脚本, undefined 表示旧版脚本没回报 (按"不知道"处理, 不吹牛)
+            this._lastMergeHadSubtitles = (subInfo === true) ? true : (subInfo === false ? false : null);
+            this._lastSubtitleReason = (subInfo === false) ? subReason : null;
+            const noSubs = this._lastMergeHadSubtitles === false;
+            const subWhy = this._lastSubtitleReason ? `：${this._lastSubtitleReason}` : '';
+            const subUnknown = this._lastMergeHadSubtitles === null;
+            this.showStatus(noSubs
+                ? `⚠️ 合并完成，但这一集没有烧上中文字幕${subWhy}（成片已保存，可重跑合并）`
+                : (subUnknown ? `✅ 合并成功: ${episodeName}（未回报字幕状态）` : `✅ 合并成功: ${episodeName}`),
+                noSubs ? 'warning' : 'success');
             if (showProgress) {
-                this._setPostProgress(100, '✅ 音频识别与字幕烧录完成', `成片: ${relPath || ''}`);
+                this._setPostProgress(100,
+                    noSubs ? `⚠️ 合并完成 (未烧中文字幕${subWhy})` : '✅ 音频识别与字幕烧录完成',
+                    `成片: ${relPath}`);
+            }
+            if (noSubs) {
+                this.notifyAttention({
+                    key: `nosub:${episodeName}`,
+                    title: `${episodeName} 合并完成，但没有中文字幕`,
+                    message: `成片已经生成，但字幕这一步被跳过了${subWhy}。\n\n`
+                        + '常见原因：这一集的音频识别不到语音，或本机缺少 ASR 模块/模型。\n'
+                        + '成片本身可以正常使用；需要字幕的话，修好原因后再点一次"📦 手动合并视频"即可重烧。',
+                    level: 'warning',
+                    tab: 'gallery',
+                });
             }
 
             // 把成片路径写回作品库记录 (绝对路径转相对路径存储, 与服务器模式保持一致)
@@ -2996,13 +3121,18 @@ class AgnesVideoGenerator {
         this._setMergeProgress(0, '准备合并...', `共 ${episodes.length} 个作品待处理`);
         let successCount = 0;
         let failCount = 0;
+        let noSubCount = 0;
 
         for (let i = 0; i < episodes.length; i++) {
             const item = episodes[i];
             const percent = Math.round(((i) / episodes.length) * 100);
             this._setMergeProgress(percent, `正在合并: ${item.title}`, `第 ${i + 1}/${episodes.length} 集`);
             try {
-                await this.autoMergeAfterGeneration(item.title);
+                // force: 这是用户明确点的"合并", 不该因为"启用自动合并"没勾选就静默什么都不做 ——
+                // 以前这里没传 force, 结果是"提示合并成功、目录里却没有文件"。
+                const relPath = await this.autoMergeAfterGeneration(item.title, { force: true, showProgress: true });
+                if (!relPath) throw new Error('合并没有产出成片 (未返回成片路径)');
+                if (this._lastMergeHadSubtitles === false) noSubCount++;
                 successCount++;
                 this._setMergeProgress(Math.round(((i + 1) / episodes.length) * 100),
                     `✅ ${item.title} 合并成功`, `第 ${i + 1}/${episodes.length} 集`);
@@ -3018,8 +3148,8 @@ class AgnesVideoGenerator {
 
         this._setMergeProgress(100,
             failCount > 0
-                ? `完成: ${successCount} 成功 / ${failCount} 失败`
-                : `✅ 全部合并完成!`,
+                ? `完成: ${successCount} 成功 / ${failCount} 失败${noSubCount ? ` (其中 ${noSubCount} 集未烧字幕)` : ''}`
+                : `✅ 全部合并完成!${noSubCount ? ` (${noSubCount} 集未烧中文字幕, 见提示)` : ''}`,
             failCount > 0
                 ? `${successCount} 个成功，${failCount} 个失败`
                 : '所有作品均已成功合并');
@@ -4348,7 +4478,245 @@ ${previous}${lastCliff}
             this.setSeriesStatus('⏳ 等待当前批次任务结束后开始下一集...', 'warning');
             await this.delay(2000);
         }
+        // 刷新后恢复的挂机: 上一轮的任务还在轮询中, 等它们有结果再开始下一集,
+        // 否则同一批分镜会被重复提交 (白耗配额)。
+        while (this._autoRunning && !this.isGenerating
+            && this._activeJobs && this._activeJobs.size > 0) {
+            this.setSeriesStatus(`⏳ 等待上一轮 ${this._activeJobs.size} 个任务结束后继续...`, 'warning');
+            await this.delay(2000);
+        }
     }
+
+    /* ================= 挂机运行痕迹: 刷新/断网/关页面都不丢任务 ================= */
+
+    /**
+     * 把"正在挂机"写进本地存储。
+     *
+     * 以前这是纯内存状态 (一个 for 循环 + _autoRunning 标记), 页面一刷新就什么都没了:
+     * 用户看到的是"任务凭空消失", 既没有提醒, 也不知道该不该重来。
+     * 现在的规矩: 只有用户点"⏹️ 停止全剧生成"才会清除痕迹, 其余情况 (刷新/断网/关页面)
+     * 一律留下状态, 下次打开时接着跑。
+     * @param {object} [patch] 要覆盖的字段; 传 {} 表示只刷新时间戳
+     */
+    saveRunState(patch = {}) {
+        try {
+            const prev = this.loadRunState() || {};
+            const s = this.series || {};
+            const st = Object.assign({
+                active: !!this._autoRunning,
+                paused: !!this._autoPaused,
+                title: s.title || '',
+                season: s.season || 1,
+                ep: s.nextEpisode || 1,
+                nextEpisode: s.nextEpisode || 1,
+                totalEpisodes: s.totalEpisodes || 0,
+                done: this._autoDone || 0,
+                phase: 'generating',      // generating | waiting-network | stalled | done
+                note: '',
+                startedAt: prev.startedAt || Date.now(),
+                updatedAt: Date.now(),
+            }, prev, patch);
+            st.updatedAt = Date.now();
+            localStorage.setItem('agnes_auto_run', JSON.stringify(st));
+            return st;
+        } catch (_) { return null; }   // 存储写不进去不影响生成
+    }
+
+    loadRunState() {
+        try {
+            const raw = localStorage.getItem('agnes_auto_run');
+            if (!raw) return null;
+            const st = JSON.parse(raw);
+            return (st && typeof st === 'object') ? st : null;
+        } catch (_) { return null; }
+    }
+
+    clearRunState() {
+        try { localStorage.removeItem('agnes_auto_run'); } catch (_) { /* 忽略 */ }
+    }
+
+    /** 把落盘状态说成人话 (用于提醒) */
+    runStateText(st) {
+        if (!st) return '';
+        const ep = st.nextEpisode || st.ep || 1;
+        const total = st.totalEpisodes ? ` / 共 ${st.totalEpisodes} 集` : '';
+        const when = st.updatedAt ? new Date(st.updatedAt).toLocaleString('zh-CN') : '';
+        const phase = { generating: '生成中', 'waiting-network': '等待网络', stalled: '卡住待处理', done: '已完成' }[st.phase] || '生成中';
+        return `《${st.title || '未命名'}》第 ${ep} 集${total} · ${phase}`
+            + (st.done ? ` · 已完成 ${st.done} 集` : '')
+            + (when ? `\n（记录于 ${when}）` : '');
+    }
+
+    /**
+     * 页面加载后, 按落盘痕迹决定怎么接着干。
+     *   · 上次是"正在生成" → 直接继续 (刷新不该让挂机断掉, 只有用户点停止才算停)
+     *   · 上次是"卡住"     → 弹提醒让用户选继续/停止 (卡住往往需要人看一眼, 不擅自烧配额)
+     *   · 上次是"暂停"     → 恢复成暂停态, 等用户点继续
+     */
+    async resumeAutoRunOnLoad() {
+        const st = this.loadRunState();
+        if (!st || !st.active) return;
+        this.setSeriesStatus(`♻️ 检测到上次未结束的挂机任务：${(this.runStateText(st) || '').split('\n')[0]}\n正在按记录继续...`, 'warning');
+
+        if (!this._online) {
+            // 联网后 onNetworkChange 会再次调用这里
+            this.saveRunState({ phase: 'waiting-network', note: '等待网络恢复' });
+            this.notifyAttention({
+                key: 'resume-offline',
+                title: '网络未连接，挂机任务已挂起',
+                message: `上次的挂机任务还在：\n${this.runStateText(st)}\n\n`
+                    + '已提交到平台的任务会在平台侧继续生成；本机网络恢复后会自动接着跑，'
+                    + '不需要你重新点一次"一键生成本剧全部视频"。',
+                level: 'warning',
+                tab: 'workshop',
+                actions: [
+                    { text: '🔍 先扫描找回', cls: 'btn-secondary', run: () => this.scanTasks() },
+                    { text: '⏹️ 停止挂机', cls: 'btn-secondary', run: () => this.stopAutoRun() },
+                ],
+            });
+            return;
+        }
+
+        if (st.phase === 'stalled') {
+            this.notifyAttention({
+                key: 'resume-stalled',
+                title: '上次的挂机任务卡住了，要继续吗？',
+                message: `上次停在这里：\n${this.runStateText(st)}\n\n`
+                    + '已完成的分镜片段都保留着，不会重做也不会重复消耗配额（平台已生成完成的会直接取回）。',
+                level: 'warning',
+                tab: 'workshop',
+                actions: [
+                    { text: '🚀 继续生成', cls: 'btn-primary', run: () => this.autoGenerateAllSeries({ autoResume: true }) },
+                    { text: '🔍 任务扫描并找回', cls: 'btn-secondary', run: () => this.scanTasks() },
+                    { text: '⏹️ 停止挂机', cls: 'btn-secondary', run: () => this.stopAutoRun() },
+                ],
+            });
+            return;
+        }
+
+        // 暂停态: 恢复挂机状态但不往下跑
+        if (st.paused) {
+            this._autoRunning = true;
+            this._autoPaused = true;
+            this._autoDone = st.done || 0;
+            this.showAutoRunControls(true);
+            this.setSeriesStatus(`⏸️ 挂机任务已恢复为"暂停"状态 (${this.runStateText(st)})。点"▶️ 继续"开始跑下一集`, 'warning');
+            return;
+        }
+
+        this.notifyAttention({
+            key: 'resume-running',
+            title: '正在继续上次未完成的挂机任务',
+            message: `${this.runStateText(st)}\n\n`
+                + '刷新或断网不会丢任务：已完成的片段会直接复用，缺的片段只补缺的那部分。\n'
+                + '需要停下来时，请点"⏹️ 停止全剧生成"（会先跟你确认）。',
+            level: 'success',
+            tab: 'workshop',
+            actions: [
+                { text: '⏹️ 停止挂机', cls: 'btn-secondary', run: () => this.stopAutoRun() },
+            ],
+        });
+        await this.delay(600);      // 让提醒先显示出来, 再开始跑
+        this.kickAutoLoop();
+    }
+
+    /**
+     * 按需把挂机循环真正跑起来。
+     * 为什么需要它: "正在挂机"有两种存在形式 —— 状态 (落盘/_autoRunning) 和真正在跑的 for 循环。
+     * 刷新后恢复、暂停转继续、断网重连都属于"有状态但没有循环", 必须显式再启动一次,
+     * 否则用户点了"▶️ 继续"或网络恢复了却什么都没发生。
+     */
+    kickAutoLoop() {
+        if (this._autoPaused) return;          // 用户按了暂停: 不擅自开跑
+        if (this._autoLoopActive) return;      // 循环已经在跑, 别开第二个
+        this._autoRunning = false;             // 交回给 autoGenerateAllSeries 重新接管 (它自己会置 true)
+        Promise.resolve(this.autoGenerateAllSeries({ autoResume: true }))
+            .catch(e => console.warn('自动续跑失败:', e && e.message));
+    }
+
+    /** 挂机按钮组: 恢复页面时按落盘状态显示 */
+    showAutoRunControls(running) {
+        const startBtn = document.getElementById('auto-all-btn');
+        if (startBtn) startBtn.disabled = !!running;
+        const pauseBtn = document.getElementById('auto-pause-btn');
+        if (pauseBtn) {
+            pauseBtn.style.display = running ? '' : 'none';
+            pauseBtn.textContent = this._autoPaused ? '▶️ 继续' : '⏸️ 暂停';
+        }
+        const stopBtn = document.getElementById('auto-stop-btn');
+        if (stopBtn) stopBtn.style.display = running ? '' : 'none';
+    }
+
+    /* ================= 断网 / 重连 ================= */
+
+    /** 网络状态变化: 挂机期间断网不中止任务, 恢复后自动接着跑 */
+    onNetworkChange(isOnline) {
+        const was = this._online;
+        this._online = isOnline;
+        if (isOnline) {
+            if (!was) {
+                const st = this.loadRunState();
+                const hasRun = !!(st && st.active) || this._autoRunning;
+                this.showStatus('🌐 网络已恢复', 'success');
+                if (hasRun) {
+                    this.notifyAttention({
+                        key: 'net-back',
+                        title: '网络已恢复，继续执行未完成的任务',
+                        message: (this.runStateText(st) || '挂机任务进行中')
+                            + '\n\n断网期间已提交到平台的任务不会白跑，恢复后会直接取回；'
+                            + '缺的片段只补缺的那部分，不会整集重做。',
+                        level: 'success',
+                        tab: 'workshop',
+                        actions: [
+                            { text: '🔍 任务扫描并找回', cls: 'btn-secondary', run: () => this.scanTasks() },
+                            { text: '⏹️ 停止挂机', cls: 'btn-secondary', run: () => this.stopAutoRun() },
+                        ],
+                    });
+                    // 循环还在跑的话它自己会从"等网络"里出来; 循环已经结束的 (刷新/卡住后)
+                    // 这里重新把它跑起来
+                    if (!this._autoLoopActive) this.kickAutoLoop();
+                } else {
+                    const un = this.getUnfinishedTasks();
+                    if (un.all.length) {
+                        this.notifyAttention({
+                            key: 'net-back-unfinished',
+                            title: '网络已恢复，还有未完成的任务',
+                            message: `还有 ${un.all.length} 个任务没跑完，可以现在把它们接着做完。`,
+                            level: 'warning',
+                            tab: 'generate',
+                            actions: [
+                                { text: '🔄 全部重试', cls: 'btn-primary', run: () => this.retryAllUnfinished() },
+                                { text: '🔍 任务扫描并找回', cls: 'btn-secondary', run: () => this.scanTasks() },
+                            ],
+                        });
+                    }
+                }
+            }
+            return;
+        }
+        // 断网
+        if (was !== false) {
+            this.showStatus('🌐 网络已断开：已提交到平台的任务会在平台侧继续，恢复后自动接着跑', 'warning');
+            if (this._autoRunning) {
+                this.saveRunState({ phase: 'waiting-network', note: '断网等待中' });
+                this.setSeriesStatus('🌐 网络已断开，挂机不会中止：正在等待网络恢复 (期间不会重复提交任务)', 'warning');
+            }
+        }
+    }
+
+    /** 断网时挂机在这里等 (用户点停止/暂停则退出等待) */
+    async waitForNetwork(label = '') {
+        if (this._online) return this._autoRunning;
+        const startedAt = Date.now();
+        while (!this._online && this._autoRunning) {
+            const mins = Math.floor((Date.now() - startedAt) / 60000);
+            this.setSeriesStatus(`🌐 网络已断开，正在等待恢复${label ? `（${label}尚未开始）` : ''}`
+                + `${mins > 0 ? ` · 已等 ${mins} 分钟` : ''}\n已提交到平台的任务不受影响；不想等了请点"⏹️ 停止全剧生成"`, 'warning');
+            await this.delay(3000);
+        }
+        return this._autoRunning;
+    }
+
 
     /**
      * 续跑一个中断的剧集 (不重新写剧本, 沿用已存的分镜提示词, 保证与已生成片段连贯):
@@ -4456,7 +4824,8 @@ ${previous}${lastCliff}
      * 全自动生成全剧: 从下一集循环"编剧AI写剧本 -> 批量生成该集全部分镜视频"直到总集数完结。
      * 期间可暂停/继续 (当前集完成后生效) 或停止; 启动前弹确认对话框。
      */
-    async autoGenerateAllSeries() {
+    async autoGenerateAllSeries(opts = {}) {
+        const autoResume = !!opts.autoResume;   // 由"刷新/断网后按落盘痕迹恢复"调用: 不再弹确认框
         if (this._autoRunning) return this.setSeriesStatus('⚠️ 全剧自动生成已在运行中', 'error');
         if (this.isGenerating) return this.setSeriesStatus('⚠️ 已有任务在生成中，请等待完成后再启动全剧生成', 'error');
         if (!this.llmClient()) {
@@ -4476,6 +4845,7 @@ ${previous}${lastCliff}
         const hasNewEpisodes = s.nextEpisode <= s.totalEpisodes;
 
         if (!hasNewEpisodes && resumeList.length === 0) {
+            this.clearRunState();   // 确实没有要干的了, 痕迹可以清掉
             return this.setSeriesStatus(`✅ 本剧 ${s.totalEpisodes} 集已全部生成。如需续写请在"剧集设定"中调大总集数`, 'success');
         }
 
@@ -4501,16 +4871,19 @@ ${previous}${lastCliff}
         }
         msg += `每集：${s.scenesPerEpisode} 个分镜 × ${s.sceneDuration}秒, ${s.resolution} ${s.ratio}\n`
             + `\n全自动流程：先续跑中断的剧集，再循环"编剧AI写剧本 → 批量生成全部分镜视频"直到完结。\n`
-            + `某集若因断网没跑完，会自动停下并保留已生成的片段，恢复网络后再次点击本按钮即可从该集继续。\n`
+            + `期间断网不会丢任务：会自动等待网络恢复后接着跑，已提交到平台的任务照常取回。\n`
+            + `刷新/关闭页面也不会丢：下次打开会按记录自动继续（只有你点"⏹️ 停止全剧生成"才算停止）。\n`
             + `期间可随时【暂停/继续】(当前集完成后生效) 或【停止】。\n`
             + `注意：将连续消耗平台配额，免费档每集约需数分钟甚至更久，挂机等待即可。`;
-        const ok = await this.showConfirm({
-            title: '🚀💤 启用一键生成本剧全部视频',
-            message: msg,
-            okText: '🚀 确定启用',
-            cancelText: '取消'
-        });
-        if (!ok) return this.setSeriesStatus('已取消全剧生成', 'warning');
+        if (!autoResume) {
+            const ok = await this.showConfirm({
+                title: '🚀💤 启用一键生成本剧全部视频',
+                message: msg,
+                okText: '🚀 确定启用',
+                cancelText: '取消'
+            });
+            if (!ok) return this.setSeriesStatus('已取消全剧生成', 'warning');
+        }
 
         // 一键挂机模式默认开启自动合并 (不写入 localStorage，手动模式仍保持用户原有选择)
         const _originalAutoMerge = localStorage.getItem('autoMergeEnabled') === 'true';
@@ -4519,13 +4892,12 @@ ${previous}${lastCliff}
 
         this._autoRunning = true;
         this._autoPaused = false;
-        const startBtn = document.getElementById('auto-all-btn');
-        if (startBtn) startBtn.disabled = true;
-        const pauseBtn = document.getElementById('auto-pause-btn');
-        if (pauseBtn) { pauseBtn.style.display = ''; pauseBtn.textContent = '⏸️ 暂停'; }
-        const stopBtn = document.getElementById('auto-stop-btn');
-        if (stopBtn) stopBtn.style.display = '';
+        this._autoDone = 0;
+        this._autoLoopActive = true;
+        this.showAutoRunControls(true);
         this.switchTab('workshop');
+        // 落盘"正在挂机": 只有用户点停止才会清掉 (刷新/断网/关页面都留痕)
+        this.saveRunState({ active: true, paused: false, phase: 'generating', done: 0, note: '', startedAt: (this.loadRunState() || {}).startedAt || Date.now() });
 
         let done = 0;
         let stalled = null; // 因分镜没跑完而中止的剧集 (绝不能再往后跳, 否则这些分镜会永久丢失)
@@ -4535,6 +4907,9 @@ ${previous}${lastCliff}
                 if (!this._autoRunning) break;
                 await this._waitAutoSlot(`第 ${prog.epNo} 集`);
                 if (!this._autoRunning) break;
+                // 断网不中止挂机: 等网络恢复再续跑这一集
+                if (!await this.waitForNetwork(`第 ${prog.epNo} 集`)) break;
+                this.saveRunState({ phase: 'generating', ep: prog.epNo, nextEpisode: prog.epNo, done });
 
                 this.setSeriesStatus(`♻️ 续跑中断的第 ${prog.epNo} 集：已完成 ${prog.done}/${prog.total}`
                     + (prog.unsaved.length ? `，先重新下载 ${prog.unsaved.length} 个片段` : '')
@@ -4542,10 +4917,12 @@ ${previous}${lastCliff}
                 const r = await this.finishEpisodeProgress(prog);
                 if (!r.remaining) {
                     done++;
+                    this._autoDone = done;
+                    this.saveRunState({ phase: 'generating', ep: prog.epNo, nextEpisode: prog.epNo, done });
                     this.setSeriesStatus(`✅ 第 ${prog.epNo} 集已补齐 (${done}/${totalUnits})，继续下一集...`, 'success');
                     // 这一集是靠"重新下载"补齐的 (没有重新生成, 因此不会走生成结束后的合并流程),
                     // 这里补合并, 否则用户会发现片段齐了却没有成片
-                    await this.mergeRecoveredEpisodes([prog.title]);
+                    await this.ensureEpisodeMerged(prog.title);
                     continue;
                 }
                 stalled = r.remaining;
@@ -4558,7 +4935,11 @@ ${previous}${lastCliff}
                     if (!this._autoRunning) break;
                     await this._waitAutoSlot(`第 ${ep} 集`);
                     if (!this._autoRunning) break;
+                    // 断网不中止挂机: 在这里等网络恢复 (用户不点停止就一直等)
+                    if (!await this.waitForNetwork(`第 ${ep} 集`)) break;
 
+                    this._autoDone = done;
+                    this.saveRunState({ phase: 'generating', ep, nextEpisode: ep, done });
                     this.setSeriesStatus(`🤖 全剧生成中 [${done + 1}/${totalUnits}]：编剧AI正在编写第 ${ep} 集...`);
                     if (s.characters.length === 0) {
                         const okC = await this.generateCharacters();
@@ -4570,10 +4951,20 @@ ${previous}${lastCliff}
                         + this.llmErrorHint(this._lastSeriesError));
                     await this.launchScenes(true); // 挂机模式: 跳过单集确认对话框
                     done++;
+                    this._autoDone = done;
+                    this.saveRunState({ phase: 'generating', ep, nextEpisode: ep, done });
 
                     // 关键校验: 本集若仍有分镜没落盘, 立即中止而不是跳到下一集,
                     // 否则中断的那一集会被 nextEpisode 跳过, 分镜片段永久丢失。
-                    const prog = this.episodeSceneProgress({ no: ep, scenes: s.currentScenes });
+                    let prog = this.episodeSceneProgress({ no: ep, scenes: s.currentScenes });
+                    // 分镜没齐 + 当前断网 -> 这不是"失败", 是网络问题。等网络回来后把这一集补完再往下走,
+                    // 而不是把用户丢在"第 N 集未跑完"的提醒里 (挂机就该扛住这种抖动)。
+                    if ((prog.pending.length || prog.unsaved.length) && !this._online) {
+                        this.saveRunState({ phase: 'waiting-network', ep, nextEpisode: ep, done, note: `第 ${ep} 集等网络` });
+                        if (!await this.waitForNetwork(`第 ${ep} 集补缺`)) break;
+                        await this.finishEpisodeProgress(prog);
+                        prog = this.episodeSceneProgress({ no: ep, scenes: s.currentScenes });
+                    }
                     if (prog.pending.length || prog.unsaved.length) {
                         stalled = {
                             epNo: ep, title: prog.title, total: prog.total, done: prog.done,
@@ -4581,6 +4972,9 @@ ${previous}${lastCliff}
                         };
                         break;
                     }
+                    // 本集分镜已齐: 确保成片真的出来了 (以前只有生成入口会合并,
+                    // 走"重新下载补齐"的集会出现"片段齐了却没有成片")
+                    await this.ensureEpisodeMerged(prog.title);
                     this.setSeriesStatus(`✅ 第 ${ep} 集完成 (${done}/${totalUnits})${ep < to ? '，即将开始下一集...' : ''}`);
                 }
             }
@@ -4604,23 +4998,33 @@ ${previous}${lastCliff}
                     : `第 ${this._stallRepeats} 次卡在同一处：直接再点"继续生成"不会有变化，`
                         + `请先在"未完成任务"面板里把这 ${stalled.pendingCount + stalled.unsavedCount} 个分镜处理掉`
                         + `（点单条"🔄 重试"重新生成，或删除不需要的分镜），再继续。`;
+                // 卡住了: 留下痕迹 (active 仍为 true, phase=stalled), 下次打开会提示"要不要接着跑"
+                this.saveRunState({
+                    active: true, phase: 'stalled', done,
+                    ep: stalled.epNo, nextEpisode: stalled.epNo,
+                    note: `第 ${stalled.epNo} 集未跑完`,
+                });
                 this.setSeriesStatus(`⚠️ 第 ${stalled.epNo} 集未跑完 (${detail})，全剧生成已暂停。\n${hint}`, 'warning');
 
                 this.notifyAttention({
                     key: `stall:${stallKey}`,
                     title: `第 ${stalled.epNo} 集未跑完，全剧生成已暂停`,
-                    message: `${detail}。\n\n${hint}`,
+                    message: `${detail}。\n\n${hint}\n\n`
+                        + '这条进度已记下来：关掉页面或刷新后，下次打开会问你要不要接着跑。',
                     level: 'warning',
                     tab: 'generate',   // 未完成任务面板与扫描进度都在"批量生成"页
                     actions: [
                         { text: '📋 查看未完成任务', cls: 'btn-primary', run: () => this._showUnfinishedPanel() },
                         { text: '🔍 任务扫描并找回', cls: 'btn-secondary', run: () => this.scanTasks() },
                         ...(worthRetrying ? [{ text: '🚀 继续全剧生成', cls: 'btn-secondary', run: () => this.autoGenerateAllSeries() }] : []),
+                        { text: '⏹️ 停止挂机', cls: 'btn-secondary', run: () => this.stopAutoRun() },
                     ],
                 });
             } else if (this._autoRunning) {
                 const doneMsg = `🎉 全剧自动生成完成！共完成 ${done} 集, 视频已保存到 ${this.serverOutputDir || '设置的保存位置'}\\video\\`;
                 this.setSeriesStatus(doneMsg, 'success');
+                this.clearRunState();   // 跑完了, 痕迹清掉, 下次打开不该再自动续跑
+                this._autoRunning = false;   // 走到这里说明是正常跑完, 不是被用户停止
                 if (document.hidden) {
                     this.notifyAttention({
                         title: '全剧自动生成完成',
@@ -4633,26 +5037,32 @@ ${previous}${lastCliff}
             }
         } catch (e) {
             console.error('全剧自动生成失败:', e);
+            // 中断了但没完成: 留下痕迹, 下次打开还能接着跑 (用户没点停止就不算结束)
+            this.saveRunState({ active: true, phase: 'stalled', done, note: `中断: ${e.message}` });
             this.setSeriesStatus(`❌ 全剧生成中止: ${e.message} (已完成 ${done} 集保留，可再次点击本按钮继续)`, 'error');
             this.notifyAttention({
                 title: '全剧生成已中止',
-                message: `${e.message}\n\n已完成 ${done} 集的内容全部保留，可修复原因后继续。`,
+                message: `${e.message}\n\n已完成 ${done} 集的内容全部保留，可修复原因后继续。\n`
+                    + '（这条记录已保存：下次打开页面会提示你接着跑，不会凭空丢掉）',
                 level: 'error',
                 tab: 'workshop',
                 actions: [
                     { text: '🔍 任务扫描并找回', cls: 'btn-primary', run: () => this.scanTasks() },
                     { text: '🚀 继续全剧生成', cls: 'btn-secondary', run: () => this.autoGenerateAllSeries() },
+                    { text: '⏹️ 停止挂机', cls: 'btn-secondary', run: () => this.stopAutoRun() },
                 ],
             });
         } finally {
             // 恢复一键挂机前的自动合并设置
             if (!_originalAutoMerge) localStorage.removeItem('autoMergeEnabled');
             this._syncAutoMergeUI();  // 同步还原 UI 复选框
+            const stopped = !this._autoRunning;
+            this._autoLoopActive = false;
             this._autoRunning = false;
             this._autoPaused = false;
-            if (startBtn) startBtn.disabled = false;
-            if (pauseBtn) { pauseBtn.style.display = 'none'; pauseBtn.textContent = '⏸️ 暂停'; }
-            if (stopBtn) stopBtn.style.display = 'none';
+            this.showAutoRunControls(false);
+            if (stopped) this.clearRunState();          // 只有"用户点了停止"或"真的跑完"才清痕迹
+            else this.saveRunState({ active: true });   // 其余情况保留, 下次接着跑
             this.renderSeriesUI();
         }
     }
@@ -4669,16 +5079,22 @@ ${previous}${lastCliff}
             if (!ok) return;
         }
         this._autoPaused = !this._autoPaused;
+        this.saveRunState({ active: true, paused: this._autoPaused, phase: this._autoPaused ? 'paused' : 'generating' });
         const btn = document.getElementById('auto-pause-btn');
         if (btn) btn.textContent = this._autoPaused ? '▶️ 继续' : '⏸️ 暂停';
-        if (!this._autoPaused) this.setSeriesStatus('▶️ 已继续全剧生成', 'success');
+        if (!this._autoPaused) {
+            this.setSeriesStatus('▶️ 已继续全剧生成', 'success');
+            this.kickAutoLoop();   // 刷新后恢复的"暂停"没有循环, 点继续要真的开跑
+        }
     }
 
     async stopAutoRun() {
         if (!this._autoRunning) return;
         const ok = await this.showConfirm({
             title: '⏹️ 停止全剧自动生成',
-            message: '当前集正在生成的任务也会停止，已完成的集数保留。',
+            message: '这是唯一会中断挂机的操作（刷新、断网、关页面都不会）。\n\n'
+                + '当前正在生成的任务也会停止，已完成的集数与片段全部保留；\n'
+                + '停止后不会再自动续跑，下次需要你重新点"🚀💤 一键生成本剧全部视频"。',
             okText: '⏹️ 确定停止',
             danger: true
         });
@@ -4686,7 +5102,8 @@ ${previous}${lastCliff}
         this._autoRunning = false;
         this._autoPaused = false;
         this.stopRequested = true; // 中断当前集的任务监控
-        this.setSeriesStatus('⏹️ 正在停止全剧生成...', 'warning');
+        this.clearRunState();       // 用户明确停止: 痕迹清掉, 下次打开不再自动续跑
+        this.setSeriesStatus('⏹️ 正在停止全剧生成...(已完成的集数与片段保留)', 'warning');
     }
 
     /** 应用内输入对话框 (存档命名等): 返回 Promise<string|null> */

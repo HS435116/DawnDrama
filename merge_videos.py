@@ -110,6 +110,17 @@ DROP_PURE_ENGLISH = True
 
 MAX_CHARS_PER_LINE = 16
 
+# 本次处理的字幕结果 (如实回报给上层: 成片有了 != 字幕烧上去了)。
+#   三条降级路径 (ASR 缺失 / 没识别到语音 / 烧录失败) 以前也会 exit 0 报 success,
+#   上层拿不到任何区分, 界面就一律显示"已烧录中文字幕" —— 这就是"假成功"。
+_SUBTITLE_STATUS = {'burned': None, 'reason': ''}
+
+
+def _set_subtitle_status(burned, reason=''):
+    _SUBTITLE_STATUS['burned'] = bool(burned)
+    _SUBTITLE_STATUS['reason'] = reason or ''
+
+
 # ============ 字幕样式 ============
 SUB_FONT_NAME = 'Microsoft YaHei'
 SUB_FONT_SIZE = 20
@@ -494,6 +505,7 @@ def process_video_list(video_files, output_dir, final_name, display_name):
         emit_stage('error', '分镜拼接失败')
         return None
 
+    _set_subtitle_status(None, '')   # 本次处理开始: 状态未知, 走完哪条分支就登记哪条
     merged_dur = get_media_duration(merged_path)
     print(f"  ✅ 合并完成 ({merged_dur:.2f}s)")
 
@@ -532,6 +544,7 @@ def process_video_list(video_files, output_dir, final_name, display_name):
             print(f"  ⚠️ 未识别到任何语音，输出无字幕版本")
             emit_stage('no-speech', '未识别到语音，输出无字幕版本')
             shutil.copy2(merged_path, output_abs)
+            _set_subtitle_status(False, '未识别到语音 (整集都是无对白音频)')
             emit_stage('done', f'完成 (无字幕): {final_name}')
             return output_abs
         emit_stage('srt', f'已识别 {len(all_subs)} 段语音，生成字幕文件')
@@ -556,16 +569,19 @@ def process_video_list(video_files, output_dir, final_name, display_name):
         if burn_subtitles(merged_path, srt_path, output_abs):
             final_dur = get_media_duration(output_abs)
             print(f"  ✅ 完成: {final_name}  ({final_dur:.2f}s)")
+            _set_subtitle_status(True)
             emit_stage('done', f'完成: {final_name} ({final_dur:.2f}s), 已烧录中文字幕')
         else:
             print(f"  ⚠️ 烧录失败，使用无字幕版本")
             emit_stage('burn-failed', '字幕烧录失败，已输出无字幕版本')
             shutil.copy2(merged_path, output_abs)
+            _set_subtitle_status(False, '字幕烧录失败 (ffmpeg 执行出错)')
     else:
         reason = 'ASR 未安装' if not ASR_AVAILABLE else f'未找到 ASR 模型 (MODEL_DIR={MODEL_DIR or "空"})'
         print(f"\n  ⚠️ {reason}，仅输出合并视频（无字幕）")
         emit_stage('asr-unavailable', f'{reason}，仅输出合并视频 (无字幕)')
         shutil.copy2(merged_path, output_abs)
+        _set_subtitle_status(False, reason)
         emit_stage('done', f'完成 (无字幕): {final_name}')
 
     # Clean up
@@ -660,7 +676,7 @@ def main():
         safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', out_name or '').strip() or '合并视频'
         result = process_video_list(video_files, out_dir, f'{safe_name}_完整版.mp4', safe_name)
         if result:
-            print(json.dumps({"success": True, "result": {"finalVideoPath": result, "episodeName": safe_name}}, ensure_ascii=False))
+            print(json.dumps({"success": True, "result": {"finalVideoPath": result, "episodeName": safe_name, "subtitles": _SUBTITLE_STATUS["burned"], "subtitleReason": _SUBTITLE_STATUS["reason"]}}, ensure_ascii=False))
         else:
             print(json.dumps({"success": False, "error": "合并处理失败"}))
         sys.stdout.write("\n")
@@ -676,7 +692,7 @@ def main():
         episode_name = os.path.basename(episode_dir)
         result = process_episode(episode_name, episode_dir, output_dir=episode_dir)
         if result:
-            print(json.dumps({"success": True, "result": {"finalVideoPath": result, "episodeName": episode_name}}, ensure_ascii=False))
+            print(json.dumps({"success": True, "result": {"finalVideoPath": result, "episodeName": episode_name, "subtitles": _SUBTITLE_STATUS["burned"], "subtitleReason": _SUBTITLE_STATUS["reason"]}}, ensure_ascii=False))
         else:
             print(json.dumps({"success": False, "error": "处理返回空结果"}))
         sys.stdout.write("\n")
