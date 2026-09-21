@@ -16,7 +16,7 @@
  */
 
 // ================= 版本信息 =================
-const APP_VERSION = '2.8.2';
+const APP_VERSION = '2.8.3';
 // 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date"})
 // 发布新版本时的检查清单:
 //   1) bump 本文件的 APP_VERSION、package.json 的 version、server.js 的 APP_VERSION
@@ -1721,17 +1721,17 @@ class AgnesVideoGenerator {
             this._mergeChecked.add(title);
             this.notifyAttention({
                 key: `merge-prompt:${title}`,
-                title: single ? `${title} 已生成，要现在做中文字幕吗？` : `${title} 分镜已齐，要现在合成整集吗？`,
+                title: single ? `${title} 已生成，要现在烧录中文字幕吗？` : `${title} 分镜已齐，要现在合成整集吗？`,
                 message: (single
                     ? `这一集是单分镜（共 ${prog.total} 个片段），${prog.done} 个已保存到本地。\n`
-                        + '单分镜不需要合并（拼接一个文件只会白重编码一次），所以只跑"音频识别 → 生成中文字幕"，原片保持原样。\n\n'
+                        + '单分镜不需要拼接（拼接一个文件只会白重编码一次），但会把中文字幕烧录进画面，输出一个带字幕的视频（只编码这一次）。\n\n'
                     : `这一集 ${prog.done}/${prog.total} 个片段都已保存到本地。\n`
                         + '点下面按钮可立即合成（含音频识别 + 中文字幕烧录，约 1 分钟，不消耗平台配额）。\n\n')
                     + '也可以到"短剧工坊 → 视频合并设置"勾上「启用自动合并」，以后就自动完成。',
                 level: 'warning',
                 tab: 'workshop',
                 actions: [
-                    { text: single ? '🎙️ 立即生成中文字幕' : '🎬 立即合并成片', cls: 'btn-primary', run: () => this.mergeEpisodeNow(title) },
+                    { text: single ? '🎙️ 立即烧录中文字幕' : '🎬 立即合并成片', cls: 'btn-primary', run: () => this.mergeEpisodeNow(title) },
                     { text: '📦 稍后处理', cls: 'btn-secondary', run: () => this.switchTab('workshop') },
                 ],
             });
@@ -2914,16 +2914,17 @@ class AgnesVideoGenerator {
             const subWhy = this._lastSubtitleReason ? `：${this._lastSubtitleReason}` : '';
             const subUnknown = this._lastMergeHadSubtitles === null;
             const srtName = srtFile ? String(srtFile).split(/[\/]/).pop() : '';
+            const outName = relPath ? String(relPath).split(/[\/]/).pop() : '';
             if (singleMode) {
-                // 单分镜: 没有合并, 也不烧录 (不重编码), 交付的是字幕文件 + 原片
+                // 单分镜: 不拼接 (不白重编码), 但照样把中文字幕烧进画面, 产出一个带字幕的视频
                 this.showStatus(noSubs
                     ? `⚠️ 单分镜：未生成中文字幕${subWhy}（原片保持原样）`
-                    : `🎙️ 单分镜：已跳过合并，已生成中文字幕${srtName ? ` (${srtName})` : ''}`,
+                    : `🎙️ 单分镜：已跳过拼接，已把中文字幕烧录进视频${outName ? ` (${outName})` : ''}`,
                     noSubs ? 'warning' : 'success');
                 if (showProgress) {
                     this._setPostProgress(100,
-                        noSubs ? `⚠️ 单分镜: 未生成中文字幕${subWhy}` : '✅ 单分镜: 已生成中文字幕 (未合并)',
-                        `原片: ${relPath}${srtName ? ` · 字幕: ${srtName}` : ''}`);
+                        noSubs ? `⚠️ 单分镜: 未生成中文字幕${subWhy}` : '✅ 单分镜: 已烧录中文字幕 (未拼接)',
+                        `带字幕视频: ${relPath}${srtName ? ` · 字幕: ${srtName}` : ''}`);
                 }
             } else if (noSubs) {
                 this.showStatus(`⚠️ 合并完成，但这一集没有烧上中文字幕${subWhy}（成片已保存，可重跑合并）`, 'warning');

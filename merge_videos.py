@@ -589,11 +589,23 @@ def process_video_list(video_files, output_dir, final_name, display_name):
         else:
             srt_out = os.path.join(output_dir, f'{display_name}_字幕.srt')
             write_srt_file(all_subs, srt_out)
-            _set_subtitle_status(True)
-            _set_subtitle_path(srt_out)
             emit_stage('srt', f'已识别 {len(all_subs)} 段语音，生成字幕文件')
             print(f"\n  📄 字幕文件: {os.path.basename(srt_out)}")
-            emit_stage('done', f'单分镜: 已生成中文字幕 ({os.path.basename(srt_out)})')
+            # 单分镜: 不拼接, 但照样把字幕烧进画面 —— 只编码这一次, 输出 <集名>_完整版.mp4
+            print(f"\n  🔥 烧录中文字幕中（字体: {SUB_FONT_NAME}, 字号: {SUB_FONT_SIZE}）...")
+            emit_stage('burn', f'烧录中文字幕中 (字体: {SUB_FONT_NAME})')
+            if burn_subtitles(video_files[0], srt_out, output_abs):
+                _set_subtitle_status(True)
+                _set_subtitle_path(srt_out)
+                final_dur = get_media_duration(output_abs)
+                print(f"  ✅ 完成: {final_name}  ({final_dur:.2f}s)")
+                emit_stage('done', f'单分镜: 已烧录中文字幕 -> {final_name}')
+                return output_abs
+            # 烧录失败不能拿原片复制一份充数 (那只会多一个没字幕的副本), 原片保持原样
+            _set_subtitle_status(False, '字幕烧录失败 (ffmpeg 执行出错)')
+            _set_subtitle_path(srt_out)
+            emit_stage('burn-failed', '字幕烧录失败，未生成带字幕的视频 (原片保持原样)')
+            print(f"  ⚠️ 烧录失败，未生成带字幕的视频 (原片保持原样)")
         print(f"  ✅ 单分镜处理完成: {os.path.basename(video_files[0])}")
         return video_files[0]
 
@@ -637,11 +649,12 @@ def process_video_list(video_files, output_dir, final_name, display_name):
             _set_subtitle_status(False, '字幕烧录失败 (ffmpeg 执行出错)')
 
 
-    # Clean up
-    try:
-        os.remove(merged_path)
-    except OSError:
-        pass
+    # Clean up (单分镜时 merged_path 就是用户的原片, 绝不能删)
+    if not single_input:
+        try:
+            os.remove(merged_path)
+        except OSError:
+            pass
     if srt_path:
         try:
             os.remove(srt_path)
