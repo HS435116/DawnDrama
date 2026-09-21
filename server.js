@@ -366,7 +366,11 @@ app.get('/api/save-progress', (req, res) => {
     });
 });
 
-/** 探测 Range 支持与文件总大小 (不支持就老实退回单连接) */
+/**
+ * 探测 Range 支持与文件总大小 (不支持就老实退回单连接)。
+ * ok=false 表示"这次根本没连上平台", 与"平台文件确实变了"是两回事 —— 调用方必须据此
+ * 保留已有断点, 否则一次网络抖动就会把已下载的部分当成过期数据删掉。
+ */
 async function probeDownload(url, headers) {
     const ac = new AbortController();
     // 探测只读响应头: 读完立刻主动断开。
@@ -382,6 +386,10 @@ async function probeDownload(url, headers) {
         const m = cr.match(/\/(\d+)\s*$/);
         const rawLen = m ? parseInt(m[1], 10) : parseInt(r.headers.get('content-length') || '0', 10);
         return {
+            // 只有真正拿到成功响应才算"探到了"。网关回 5xx 时我们对平台文件一无所知,
+            // 那就不能拿它去判断"文件变了没有", 否则一次 5xx 就会把已有断点判成过期。
+            ok: r.ok,
+            status: r.status,
             supportsRange: r.status === 206,
             length: Number.isFinite(rawLen) ? rawLen : 0,
             etag: r.headers.get('etag') || '',
@@ -389,7 +397,7 @@ async function probeDownload(url, headers) {
         };
     } catch (e) {
         console.warn(`⚠️ [save-video] Range 探测失败 (${e.message})，改用单连接下载`);
-        return { supportsRange: false, length: 0, etag: '', lastModified: '' };
+        return { ok: false, reason: e.message, supportsRange: false, length: 0, etag: '', lastModified: '' };
     } finally {
         clearTimeout(timer);
         try { ac.abort(); } catch (_) { /* 断开探测连接 */ }
@@ -405,6 +413,17 @@ function planSegments(from, total) {
     const segs = [];
     for (let s = from; s < total; s += each) segs.push([s, Math.min(s + each - 1, total - 1)]);
     return segs;
+}
+
+/**
+ * 重新抛出下载错误时保留底层原因。
+ * undici 把真实原因 (ENOTFOUND / ECONNREFUSED / ECONNRESET ...) 放在 err.cause 里,
+ * 只留一句 "fetch failed" 的话, 上层就没法区分"本机断网"和"平台断流"。
+ */
+function wrapDownloadError(e, msg) {
+    const w = new Error(msg);
+    w.cause = e;
+    return w;
 }
 
 /**
@@ -433,6 +452,8 @@ async function downloadSegment(url, partPath, headers, start, end, onBytes) {
                             headers: { ...headers, Range: `bytes=${pos}-${end}`, 'accept-encoding': 'identity' },
                             signal: ac.signal
                         });
+                        // 416 = 起点越界: 本地记的长度比平台文件还长, 重试同一个区间没有意义
+                        if (resp.status === 416) throw new Error('平台返回 416 (本地记录的长度超出平台文件)');
                         if (!resp.ok && resp.status !== 206) throw new Error(`HTTP ${resp.status}`);
                         for await (const chunk of resp.body) {
                             lastAt = Date.now();
@@ -453,7 +474,7 @@ async function downloadSegment(url, partPath, headers, start, end, onBytes) {
                 throw new Error(`该段未收完 (${pos}/${end + 1})`);
             } catch (e) {
                 const why = stallNote || e.message;
-                if (attempt >= DL_SEGMENT_RETRIES) throw new Error(`${why} (该段已重试 ${attempt} 次)`);
+                if (attempt >= DL_SEGMENT_RETRIES) throw wrapDownloadError(e, `${why} (该段已重试 ${attempt} 次)`);
                 console.warn(`⚠️ [save-video] 分片重试 ${attempt}/${DL_SEGMENT_RETRIES}: ${why} — 从 ${(pos / 1048576).toFixed(2)}MB 继续`);
                 await new Promise((r) => setTimeout(r, 800 * attempt));
             }
@@ -466,16 +487,21 @@ async function downloadSegment(url, partPath, headers, start, end, onBytes) {
 /**
  * 单连接下载 (平台不支持 Range 时用); 支持 Range 时也能从 from 处续传。
  * @param {Function} [onWatch] 观察窗口回调 (已写字节, 已耗时ms); 返回 'segment' 表示"太慢, 改分段"
- * @returns {Promise<{upgrade:boolean, pos:number}>} upgrade=true 表示提前中止以改走分段
+ * @param {Function} [onTick]  每秒回调一次当前连续写入位置 (给上层落盘续传点用)
+ * @returns {Promise<{upgrade:boolean, pos:number, total:number}>}
+ *          upgrade=true 表示提前中止以改走分段; total 可能来自平台的 Content-Range (探测失败时用得上)
  */
-async function downloadSingleStream(url, partPath, headers, from, total, onBytes, onWatch) {
+async function downloadSingleStream(url, partPath, headers, from, total, onBytes, onWatch, onTick) {
     const fh = await fs.promises.open(partPath, 'r+');
     let pos = from;
     let upgrade = false;
+    let restarts = 0;              // 本地断点作废、从 0 重下的次数 (只允许很少几次, 防止死循环)
     const tStart = Date.now();
     let lastWatch = tStart;
+    let lastTick = tStart;
+    let attempt = 1;
     try {
-        for (let attempt = 1; attempt <= DL_SEGMENT_RETRIES; attempt++) {
+        while (attempt <= DL_SEGMENT_RETRIES) {
             let stallNote = '';
             try {
                 await acquireSlot();
@@ -493,7 +519,40 @@ async function downloadSingleStream(url, partPath, headers, from, total, onBytes
                         const h = { ...headers, 'accept-encoding': 'identity' };
                         if (pos > 0) h.Range = `bytes=${pos}-`;
                         response = await fetch(url, { headers: h, signal: ac.signal });
+
+                        // 416 = 平台认为"起点越界": 本地断点比平台文件还长 (上次留了虚高的半成品,
+                        // 或平台换了文件)。绝对不能拿同一个越界 Range 反复重试 —— 那会永远 416,
+                        // 用户看到的就是"一直在下载却永远存不下来"。丢掉本地这部分, 从 0 重下一次。
+                        if (response.status === 416 && pos > 0 && restarts < 2) {
+                            restarts++;
+                            try { await response.body?.cancel(); } catch (_) { /* 已断开 */ }
+                            await fh.truncate(0);
+                            console.warn(`⚠️ [save-video] 平台返回 416 (本地断点 ${(pos / 1048576).toFixed(2)}MB 超出平台文件长度)，丢弃本地断点改为从 0 重下`);
+                            pos = 0;
+                            lastAt = Date.now();
+                            continue;   // 这次不算失败, 不消耗重试次数
+                        }
+                        if (response.status === 416) throw new Error('平台返回 416 (下载区间超出平台文件长度)');
                         if (!response.ok && response.status !== 206) throw new Error(`HTTP ${response.status}`);
+
+                        // 平台忽略了 Range 直接回整份: 不能把整份追加在已有断点后面 (会拼出坏文件),
+                        // 只能丢掉本地这部分重下。探测失败时不知道平台支不支持 Range, 全靠这里兜底。
+                        if (response.status === 200 && pos > 0) {
+                            if (restarts >= 2) throw new Error('平台始终忽略 Range, 无法从断点续传');
+                            restarts++;
+                            try { await response.body?.cancel(); } catch (_) { /* 已断开 */ }
+                            await fh.truncate(0);
+                            console.warn('⚠️ [save-video] 平台忽略 Range (回 200 整份)，丢弃本地断点改为从 0 重下');
+                            pos = 0;
+                            lastAt = Date.now();
+                            continue;   // 同上, 不消耗重试次数
+                        }
+
+                        // 探测失败时 total 是未知的, 这里从 Content-Range 把真实长度补回来
+                        if (!total) {
+                            const m = (response.headers.get('content-range') || '').match(/\/(\d+)\s*$/);
+                            if (m) total = parseInt(m[1], 10);
+                        }
                         for await (const chunk of response.body) {
                             lastAt = Date.now();
                             await fh.write(chunk, 0, chunk.length, pos);
@@ -502,6 +561,10 @@ async function downloadSingleStream(url, partPath, headers, from, total, onBytes
                             if (onWatch && Date.now() - lastWatch >= 500) {
                                 lastWatch = Date.now();
                                 if (onWatch(pos - from, Date.now() - tStart) === 'segment') { upgrade = true; break; }
+                            }
+                            if (onTick && Date.now() - lastTick >= 1000) {
+                                lastTick = Date.now();
+                                onTick(pos);      // 落盘续传点: 进程被杀也只丢最后一秒
                             }
                         }
                         if (upgrade && response.body) {
@@ -518,59 +581,127 @@ async function downloadSingleStream(url, partPath, headers, from, total, onBytes
                 } finally {
                     releaseSlot();
                 }
-                if (upgrade) return { upgrade: true, pos };
-                if (!total || pos >= total) return { upgrade: false, pos };
+                if (onTick) onTick(pos);
+                if (upgrade) return { upgrade: true, pos, total };
+                if (!total || pos >= total) return { upgrade: false, pos, total };
                 throw new Error(`未收完 (${pos}/${total})`);
             } catch (e) {
                 const why = stallNote || e.message;
-                if (attempt >= DL_SEGMENT_RETRIES) throw new Error(`${why} (已重试 ${attempt} 次)`);
+                if (attempt >= DL_SEGMENT_RETRIES) throw wrapDownloadError(e, `${why} (已重试 ${attempt} 次)`);
                 console.warn(`⚠️ [save-video] 重试 ${attempt}/${DL_SEGMENT_RETRIES}: ${why}`);
                 await new Promise((r) => setTimeout(r, 800 * attempt));
+                attempt++;
             }
         }
+        return { upgrade: false, pos, total };
     } finally {
         await fh.close();
     }
 }
 
 /**
+ * 收尾: 用 .part 覆盖成品文件。
+ * Windows 上目标文件被播放器/杀毒软件占用时 rm/rename 会 EPERM/EBUSY, 以前这里直接抛错,
+ * 留下一个"数据完整但没改名"的 .part —— 而下次重试正好会踩 416 那个坑。这里重试几次再报错。
+ */
+async function finalizePartFile(partPath, filePath, metaPath) {
+    let last = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            if (attempt > 1) await new Promise((r) => setTimeout(r, 400 * attempt));
+            try { fs.rmSync(filePath, { force: true }); } catch (_) { /* 旧文件被占用时改名会失败, 下一轮再试 */ }
+            fs.renameSync(partPath, filePath);
+            try { fs.rmSync(metaPath, { force: true }); } catch (_) { /* 清理断点元信息 */ }
+            return;
+        } catch (e) {
+            last = e;
+            if (!/^(EPERM|EACCES|EBUSY|ENOTEMPTY)$/.test(String(e.code || ''))) throw e;
+            console.warn(`⚠️ [save-video] 改名失败 (${e.code}), 第 ${attempt}/3 次重试`);
+        }
+    }
+    throw new Error(`无法写入成品文件 (${last && last.code}: 目标可能正在播放器中打开或被杀毒软件占用)，` +
+        `视频数据已完整下载, 关闭占用后点"重新下载"即可直接收尾, 不会重下`);
+}
+
+/**
  * 把平台视频下载到 filePath (先写 .part, 完成后再改名)。
+ *
+ * 续传点以 meta.contiguous 为准, 而不是"文件有多大":
+ * 分段并发是按偏移写入的, 某段失败时会留下"长度正好等于总长、中间却有洞"的半成品,
+ * 拿长度当续传点会算出 have == total, 于是发一个起点越界的 Range, 平台稳定回 416 ——
+ * 每次重试都一样, 表现就是"一直在下载但永远存不下来"。
+ *
  * @returns {Promise<{size:number, segments:number, resumedFrom:number}>}
  */
 async function downloadVideoFile(url, filePath, headers, progressKey) {
     const partPath = filePath + '.part';
     const metaPath = filePath + '.part.json';
     const probe = await probeDownload(url, headers);
-    const total = probe.length;
+    let total = probe.length;
     progressBegin(progressKey, total);
 
-    // 断点续传: 校验已有 .part 是不是同一个文件 (url/etag/长度/时间任一不符就重来)
     let meta = null;
     try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch (_) { /* 没有断点 */ }
-    const sameFile = !!(meta && meta.url === url
-        && ((probe.etag && meta.etag === probe.etag) || (!probe.etag && meta.length === total && meta.lastModified === probe.lastModified)));
-    let have = 0;
-    if (sameFile && fs.existsSync(partPath)) {
-        have = fs.statSync(partPath).size;
-        if (total && have > total) have = 0;
-        if (!probe.supportsRange) have = 0;   // 不能续传的平台只能重来
-    }
-    if (!sameFile || !fs.existsSync(partPath) || !have) {
+    const fileSize = fs.existsSync(partPath) ? fs.statSync(partPath).size : 0;
+    // 探测失败时不知道平台文件是否变了, 这时必须信任已有断点;
+    // 以前这里把"探测失败"当成"文件变了", 于是断网重试一次就把已下载的部分删光了。
+    const sameFile = !!(meta && meta.url === url && (probe.ok
+        ? ((probe.etag && meta.etag === probe.etag) || (!probe.etag && meta.length === total && meta.lastModified === probe.lastModified))
+        : true));
+    let have = sameFile ? Math.min(Number(meta.contiguous) || 0, fileSize) : 0;
+    if (total && have > total) have = 0;
+    if (probe.ok && !probe.supportsRange) have = 0;   // 平台确实不支持 Range: 只能从头下
+
+    const persist = (contiguous) => {
+        try {
+            fs.writeFileSync(metaPath, JSON.stringify({
+                url,
+                length: total || (meta && meta.length) || 0,
+                etag: probe.etag || (meta && meta.etag) || '',
+                lastModified: probe.lastModified || (meta && meta.lastModified) || '',
+                contiguous,          // 已确认连续写完的字节数: [0, contiguous) 一定都在
+            }));
+        } catch (_) { /* 元信息写不进去不致命, 只是下次少省一点流量 */ }
+    };
+    const progressSetTotal = (n) => {
+        const p = progressKey && dlProgress.get(String(progressKey));
+        if (p && n && !p.total) p.total = n;
+    };
+
+    if (!sameFile || !have) {
         try { fs.rmSync(partPath, { force: true }); } catch (_) { /* 忽略 */ }
         fs.writeFileSync(partPath, '');
-        fs.writeFileSync(metaPath, JSON.stringify({ url, length: total, etag: probe.etag, lastModified: probe.lastModified }));
+        persist(0);
         have = 0;
+        if (fileSize > 0) {
+            console.log(`🗑️ [save-video] 旧断点不可用 (换了文件或没有连续记录)，从 0 重下`);
+        }
+    } else if (fileSize > have) {
+        // 文件尾巴比"确认连续"的部分长 (上次被强杀, 或旧版本留下的带洞半成品): 截掉, 让它名副其实。
+        // 截断只丢"洞之后"的数据, 保住了前面连续的部分, 也保证长度不会再骗人。
+        try {
+            fs.truncateSync(partPath, have);
+            console.log(`✂️ [save-video] 断点尾部有未确认数据 (${(fileSize / 1048576).toFixed(2)}MB -> ${(have / 1048576).toFixed(2)}MB)，已截断`);
+        } catch (_) { /* 截断失败就按原样续传, 后面还有完整性校验兜底 */ }
     }
     if (have > 0) {
         console.log(`♻️ [save-video] 断点续传: 已有 ${(have / 1048576).toFixed(2)}MB / ${(total / 1048576).toFixed(2)}MB`);
     }
 
     const onBytes = (n) => progressAdd(progressKey, n);
-    const canSegment = probe.supportsRange && total >= DL_SEGMENT_MIN && (total - have) > DL_SEGMENT_MIN;
+    const onTick = (pos) => { contiguous = pos; persist(pos); };   // 每秒落一次续传点, 进程被杀最多丢 1 秒
+    let contiguous = have;      // 已确认连续写完的字节数 ([0, contiguous) 一定都在)
     let segments = 1;
 
-    if (!canSegment) {
-        await downloadSingleStream(url, partPath, headers, have, total, onBytes);
+    // 断点已经覆盖了整个文件 (上次下载完了但收尾失败: 进程被杀 / 成品文件被占用改名失败)。
+    // 直接校验收尾, 绝不能去发 `Range: bytes=<total>-` —— 平台会回 416, 那样每次重试都失败。
+    if (total && have >= total) {
+        console.log(`✅ [save-video] 断点已覆盖整个文件 (${(have / 1048576).toFixed(2)}MB)，直接收尾`);
+    } else if (!probe.ok || !probe.supportsRange || total < DL_SEGMENT_MIN || (total - have) <= DL_SEGMENT_MIN) {
+        const r = await downloadSingleStream(url, partPath, headers, have, total, onBytes, null, onTick);
+        if (r.total) { total = r.total; progressSetTotal(total); }
+        contiguous = r.pos;
+        persist(contiguous);
     } else {
         // 先单连接开跑, 在观察窗口里量一下速度再决定要不要分段。
         // 为什么要这样: 同一 CDN 同一文件, 实测单连接 0.45~1.93MB/s、3 段并发 0.65~2.50MB/s ——
@@ -581,22 +712,53 @@ async function downloadVideoFile(url, filePath, headers, progressKey) {
             if (rate >= DL_ADAPT_MIN_RATE) return null;                       // 够快, 保持单连接
             console.log(`⚡ [save-video] 单连接仅 ${rate.toFixed(2)}MB/s (< ${DL_ADAPT_MIN_RATE}MB/s)，改为分段并发`);
             return 'segment';
-        });
-        if (r.upgrade && (total - r.pos) > DL_SEGMENT_MIN) {
-            const segs = planSegments(r.pos, total);
-            segments = segs.length + 1;
-            console.log(`⬇️ [save-video] 分段下载: ${segs.length} 段 x ~${((total - r.pos) / segs.length / 1048576).toFixed(2)}MB (已完成 ${(r.pos / 1048576).toFixed(2)}MB)`);
-            await Promise.all(segs.map(([s, e]) => downloadSegment(url, partPath, headers, s, e, onBytes)));
+        }, onTick);
+        if (r.total && !total) { total = r.total; progressSetTotal(total); }
+        contiguous = r.pos;
+        persist(contiguous);
+        if (r.upgrade) {
+            if (total && (total - r.pos) > DL_SEGMENT_MIN) {
+                const segs = planSegments(r.pos, total);
+                segments = segs.length + 1;
+                console.log(`⬇️ [save-video] 分段下载: ${segs.length} 段 x ~${((total - r.pos) / segs.length / 1048576).toFixed(2)}MB (已完成 ${(r.pos / 1048576).toFixed(2)}MB)`);
+                const results = await Promise.allSettled(segs.map(([s, e]) => downloadSegment(url, partPath, headers, s, e, onBytes)));
+                // 只要有段没下完, 文件里就出现"洞"。这里把文件截回"真正连续"的位置:
+                //   · 长度不再虚高, 下次不会算出 have == total 去发越界 Range (那会稳定 416)
+                //   · 重试正好从洞的位置接着补
+                for (let i = 0; i < segs.length; i++) {
+                    if (results[i].status === 'fulfilled') contiguous = segs[i][1] + 1;
+                    else break;
+                }
+                if (contiguous < total) {
+                    const bad = results.find((x) => x.status === 'rejected');
+                    const why = (bad && bad.reason && bad.reason.message) || '分片下载失败';
+                    try { fs.truncateSync(partPath, contiguous); } catch (_) { /* 截不断也不要紧, 下次按 meta 续传 */ }
+                    persist(contiguous);
+                    throw new Error(`分段下载未完成 (${why})，已回退到连续位置 ${(contiguous / 1048576).toFixed(2)}MB，重试从该处续传`);
+                }
+                persist(contiguous);
+            } else {
+                // 测速判定"太慢, 要分段", 但剩余量不够一段: 单连接已经提前收工了, 这里接着把它下完。
+                // 少了这一步, 剩下的尾巴没人管, 收尾时只会报"下载不完整" (白下一次)。
+                const r2 = await downloadSingleStream(url, partPath, headers, r.pos, total, onBytes, null, onTick);
+                if (r2.total && !total) { total = r2.total; progressSetTotal(total); }
+                contiguous = r2.pos;
+                persist(contiguous);
+            }
         }
     }
 
+    // 完整性校验。平台总长未知时 (探测失败) 再探一次, 换来"能确认这份文件一定是完整的";
+    // 确认不了就不敢改名 —— 否则会把被截断的视频当成成品存进作品库。
+    if (!total) {
+        const p2 = await probeDownload(url, headers);
+        if (p2.ok && p2.length) { total = p2.length; progressSetTotal(total); persist(contiguous); }
+    }
     const size = fs.statSync(partPath).size;
     if (total && size !== total) {
         throw new Error(`下载不完整 (${(size / 1048576).toFixed(2)}MB / ${(total / 1048576).toFixed(2)}MB)，已保留断点，重试将从断点续传`);
     }
-    try { fs.rmSync(filePath, { force: true }); } catch (_) { /* 覆盖旧文件 */ }
-    fs.renameSync(partPath, filePath);
-    try { fs.rmSync(metaPath, { force: true }); } catch (_) { /* 清理断点元信息 */ }
+    await finalizePartFile(partPath, filePath, metaPath);
     return { size, segments, resumedFrom: have };
 }
 
@@ -627,16 +789,28 @@ app.post('/api/save-video', async (req, res) => {
             resumedFrom
         });
     } catch (err) {
-        const raw = String(err.message || err);
+        // 把 undici 藏在 err.cause 里的真实原因 (ENOTFOUND/EAI_AGAIN/ECONNREFUSED...) 一起取出来,
+        // 否则日志里只剩一句 "fetch failed", 分不清是断网还是平台挂了。
+        const causes = [];
+        for (let c = err && err.cause; c && causes.length < 3; c = c.cause) causes.push(String(c.code || c.message || c));
+        const raw = [String(err.message || err), ...causes].filter((x, i, a) => x && a.indexOf(x) === i).join(' | ');
+        const networkDown = /ENOTFOUND|EAI_AGAIN|EAI_FAIL|ENETUNREACH|ENETDOWN|ECONNREFUSED|无法解析/i.test(raw);
         const msg = err.name === 'AbortError'
             ? '下载视频超时'
-            // "terminated" 是 undici 的说法: 连接被对端掐断 (平台 CDN 断流/网关重启)
-            : (/terminated|socket hang up|ECONNRESET|UND_ERR_SOCKET|premature close/i.test(raw)
-                ? `下载连接被中断 (平台 CDN 断流: ${raw})`
-                : (raw.startsWith('保存视频失败') || raw.startsWith('下载') || raw.includes('断点') ? raw : `保存视频失败: ${raw}`));
-        console.error(`❌ [save-video] ${msg} (断点已保留, 重试可续传)`);
+            : (networkDown
+                ? `本机网络不通 (连不上平台: ${raw})，断点已保留，网络恢复后点"重新下载"会从断点续传`
+                // "terminated" 是 undici 的说法: 连接被对端掐断 (平台 CDN 断流/网关重启)
+                : (/terminated|socket hang up|ECONNRESET|UND_ERR_SOCKET|premature close/i.test(raw)
+                    ? `下载连接被中断 (平台 CDN 断流: ${raw})`
+                    : (raw.startsWith('保存视频失败') || raw.startsWith('下载') || raw.startsWith('分段') || raw.startsWith('平台返回') || raw.includes('断点') ? raw : `保存视频失败: ${raw}`)));
+        // 断点是不是真的还在? 以前这里一律写 "断点已保留", 断网重试把断点删掉时日志是骗人的。
+        let keptBytes = 0;
+        try { keptBytes = fs.statSync(filePath + '.part').size; } catch (_) { /* 没有断点文件 */ }
+        const resumable = keptBytes > 0;
+        console.error(`❌ [save-video] ${msg} (${resumable ? `断点已保留 ${(keptBytes / 1048576).toFixed(2)}MB, 重试可续传` : '(无可用断点, 下次从头下)'})`);
         progressEnd(progressKey, 'error', msg);
-        res.status(500).json({ error: msg, resumable: true });
+        // retryable=false: 断网这类错误重试几次结果完全一样, 前端不该再自动重试 (只会看着像"反复下载")
+        res.status(500).json({ error: msg, resumable, retryable: !networkDown, networkDown });
     }
 });
 

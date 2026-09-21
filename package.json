@@ -20,6 +20,7 @@
     "test:retryui": "node tests/retry-visibility.test.js",
     "test:net": "node tests/network-failures.test.js",
     "test:dl": "node tests/download-segments.test.js",
+    "test:resume": "node tests/download-resume-416.test.js",
     "test:update": "node tests/update-source.test.js",
     "dev": "nodemon server.js",
     "free-port": "node free-port.js 3000",

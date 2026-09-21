@@ -1088,6 +1088,13 @@ class AgnesVideoGenerator {
                 }
                 const err = await resp.json().catch(() => ({}));
                 const reason = this._saveErrorText(resp.status, err.error);
+                // 断网这类错误重试几次结果完全一样, 只会让界面反复显示"正在保存到本地"
+                // (看起来像在反复下载)。服务器标了 retryable=false 就直接把原因交给用户。
+                if (err.retryable === false) {
+                    console.warn(`保存到本地失败 (服务器判定重试无意义, 不再自动重试): ${reason}`);
+                    record.size = '在线视频';
+                    return reason;
+                }
                 if (i < attempts) {
                     console.warn(`保存到本地失败 (第 ${i}/${attempts} 次): ${reason} — 2s 后重试`);
                     await this.delay(2000);
@@ -1154,6 +1161,14 @@ class AgnesVideoGenerator {
     /** 把保存失败的原因翻译成"还能不能救、怎么救" */
     _saveErrorText(status, rawError) {
         const raw = String(rawError || '');
+        // 成品文件被占用: 服务器那句已经写清楚了"数据已完整, 只需收尾", 别再套一层
+        if (/无法写入成品文件|被占用/.test(raw)) return raw;
+        // 断网: 服务器已经确认连不上平台。这类错误重试没用, 说清楚"进度还在, 恢复后能续传"
+        if (/网络不通|无法解析|ENOTFOUND|EAI_AGAIN|EAI_FAIL|ENETUNREACH|ENETDOWN|ECONNREFUSED/i.test(raw)) {
+            return '本机网络已断开 (连不上平台)。已下载的部分会保留，网络恢复后点"重新下载"会从断点续传';
+        }
+        // 416: 本地断点与平台文件长度不一致 (服务器会自动丢弃断点重下, 这里给个说明)
+        if (/416/.test(raw)) return '本地断点与平台文件不一致 (HTTP 416)，已自动丢弃断点重下，可再点一次"重新下载"';
         if (/下载连接被中断|terminated|socket hang up|premature close/i.test(raw)) {
             return '平台视频下载被中断 (平台 CDN 断流)，可点重新下载再试';
         }
