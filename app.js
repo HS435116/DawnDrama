@@ -1711,29 +1711,35 @@ class AgnesVideoGenerator {
         if (!ep || !ep.scenes.length) return 'missing';
         const prog = this.episodeSceneProgress(ep);
         if (prog.pending.length || prog.unsaved.length || prog.total === 0) return 'incomplete';
-        // 已经合成过就不重复烧一遍 (同一会话内按集名 + 成片是否已落盘判断)
+        // 已经处理过就不重复跑 (同一会话内按集名记)
         if (this._mergeChecked.has(title)) return 'skipped';
+        // 单分镜: 没有可合并的内容 —— 拼接一个文件只会白重编码一次 (画质白掉一档、还白等一分钟),
+        // 所以只做"音频识别 + 生成中文字幕", 原片保持原样。
+        const single = prog.total === 1;
         if (localStorage.getItem('autoMergeEnabled') !== 'true') {
             // 不擅自合并, 但也绝不默默什么都不做 —— 给个一键提示
             this._mergeChecked.add(title);
             this.notifyAttention({
                 key: `merge-prompt:${title}`,
-                title: `${title} 分镜已齐，要现在合成整集吗？`,
-                message: `这一集 ${prog.done}/${prog.total} 个片段都已保存到本地，但「启用自动合并」没有勾选，所以没有自动合成。\n\n`
-                    + '点下面按钮可立即合成（含音频识别 + 中文字幕烧录，约 1 分钟，不消耗平台配额）。\n'
+                title: single ? `${title} 已生成，要现在做中文字幕吗？` : `${title} 分镜已齐，要现在合成整集吗？`,
+                message: (single
+                    ? `这一集是单分镜（共 ${prog.total} 个片段），${prog.done} 个已保存到本地。\n`
+                        + '单分镜不需要合并（拼接一个文件只会白重编码一次），所以只跑"音频识别 → 生成中文字幕"，原片保持原样。\n\n'
+                    : `这一集 ${prog.done}/${prog.total} 个片段都已保存到本地。\n`
+                        + '点下面按钮可立即合成（含音频识别 + 中文字幕烧录，约 1 分钟，不消耗平台配额）。\n\n')
                     + '也可以到"短剧工坊 → 视频合并设置"勾上「启用自动合并」，以后就自动完成。',
                 level: 'warning',
                 tab: 'workshop',
                 actions: [
-                    { text: '🎬 立即合并成片', cls: 'btn-primary', run: () => this.mergeEpisodeNow(title) },
-                    { text: '📦 稍后手动合并', cls: 'btn-secondary', run: () => this.switchTab('workshop') },
+                    { text: single ? '🎙️ 立即生成中文字幕' : '🎬 立即合并成片', cls: 'btn-primary', run: () => this.mergeEpisodeNow(title) },
+                    { text: '📦 稍后处理', cls: 'btn-secondary', run: () => this.switchTab('workshop') },
                 ],
             });
             return 'prompted';
         }
         this._mergeChecked.add(title);
         const relPath = await this.autoMergeAfterGeneration(title, { force: true, showProgress: true });
-        if (!relPath) throw new Error('合并没有产出成片 (未返回成片路径)');
+        if (!relPath) throw new Error(single ? '没有产出结果 (未返回路径)' : '合并没有产出成片 (未返回成片路径)');
         this.renderGallery();
         return 'merged';
     }
@@ -1744,7 +1750,7 @@ class AgnesVideoGenerator {
         this._mergeChecked.add(title);
         try {
             const relPath = await this.autoMergeAfterGeneration(title, { force: true, showProgress: true });
-            if (!relPath) throw new Error('合并没有产出成片 (未返回成片路径)');
+            if (!relPath) throw new Error('没有产出结果 (未返回路径)');
             this.renderGallery();
         } catch (e) {
             this.showStatus(`❌ ${title} 合并失败: ${e.message}`, 'error');
@@ -2874,6 +2880,8 @@ class AgnesVideoGenerator {
             let relPath = null;
             let subInfo = null;      // 字幕到底烧成功没有: 脚本会如实回报, 别再无脑说"已烧录"
             let subReason = '';      // 没烧上的原因 (由合并脚本给出)
+            let mergedFlag = null;   // 这次到底合没合并: 单分镜只出字幕, 不产成片
+            let srtFile = '';        // 单分镜交付的字幕文件
             if (window.electronAPI) {
                 if (showProgress) this._setPostProgress(3, `🎬 准备处理分镜片段`, `保存位置: ${absEpisodeDir}`);
                 const result = await window.electronAPI.mergeEpisode(absEpisodeDir, onStage);
@@ -2881,6 +2889,8 @@ class AgnesVideoGenerator {
                 relPath = this._toRelOutputPath(result.result.finalVideoPath);
                 subInfo = result.result.subtitles;
                 subReason = result.result.subtitleReason || '';
+                mergedFlag = result.result.merged;
+                srtFile = result.result.subtitlePath || '';
             } else {
                 // 服务器模式: 调用后端合并接口 (需服务器本机有 python + ffmpeg)
                 // stream=1 时后端以 NDJSON 逐行推送阶段事件, 用于实时显示 ASR/字幕烧录进度
@@ -2890,28 +2900,43 @@ class AgnesVideoGenerator {
                 relPath = this._toRelOutputPath(data.finalVideoPath);
                 subInfo = data.subtitles;
                 subReason = data.subtitleReason || '';
+                mergedFlag = data.merged;
+                srtFile = data.subtitlePath || '';
             }
             if (!relPath) throw new Error('合并没有产出成片 (服务器未返回成片路径)');
 
             // 字幕到底烧上没有: true/false 来自合并脚本, undefined 表示旧版脚本没回报 (按"不知道"处理, 不吹牛)
             this._lastMergeHadSubtitles = (subInfo === true) ? true : (subInfo === false ? false : null);
+            this._lastMergeWasSingle = (mergedFlag === false);
             this._lastSubtitleReason = (subInfo === false) ? subReason : null;
+            const singleMode = mergedFlag === false;
             const noSubs = this._lastMergeHadSubtitles === false;
             const subWhy = this._lastSubtitleReason ? `：${this._lastSubtitleReason}` : '';
             const subUnknown = this._lastMergeHadSubtitles === null;
-            this.showStatus(noSubs
-                ? `⚠️ 合并完成，但这一集没有烧上中文字幕${subWhy}（成片已保存，可重跑合并）`
-                : (subUnknown ? `✅ 合并成功: ${episodeName}（未回报字幕状态）` : `✅ 合并成功: ${episodeName}`),
-                noSubs ? 'warning' : 'success');
-            if (showProgress) {
-                this._setPostProgress(100,
-                    noSubs ? `⚠️ 合并完成 (未烧中文字幕${subWhy})` : '✅ 音频识别与字幕烧录完成',
-                    `成片: ${relPath}`);
+            const srtName = srtFile ? String(srtFile).split(/[\/]/).pop() : '';
+            if (singleMode) {
+                // 单分镜: 没有合并, 也不烧录 (不重编码), 交付的是字幕文件 + 原片
+                this.showStatus(noSubs
+                    ? `⚠️ 单分镜：未生成中文字幕${subWhy}（原片保持原样）`
+                    : `🎙️ 单分镜：已跳过合并，已生成中文字幕${srtName ? ` (${srtName})` : ''}`,
+                    noSubs ? 'warning' : 'success');
+                if (showProgress) {
+                    this._setPostProgress(100,
+                        noSubs ? `⚠️ 单分镜: 未生成中文字幕${subWhy}` : '✅ 单分镜: 已生成中文字幕 (未合并)',
+                        `原片: ${relPath}${srtName ? ` · 字幕: ${srtName}` : ''}`);
+                }
+            } else if (noSubs) {
+                this.showStatus(`⚠️ 合并完成，但这一集没有烧上中文字幕${subWhy}（成片已保存，可重跑合并）`, 'warning');
+                if (showProgress) this._setPostProgress(100, `⚠️ 合并完成 (未烧中文字幕${subWhy})`, `成片: ${relPath}`);
+            } else {
+                this.showStatus(subUnknown ? `✅ 合并成功: ${episodeName}（未回报字幕状态）` : `✅ 合并成功: ${episodeName}`,
+                    noSubs ? 'warning' : 'success');
+                if (showProgress) this._setPostProgress(100, '✅ 音频识别与字幕烧录完成', `成片: ${relPath}`);
             }
             if (noSubs) {
                 this.notifyAttention({
                     key: `nosub:${episodeName}`,
-                    title: `${episodeName} 合并完成，但没有中文字幕`,
+                    title: singleMode ? `${episodeName} 没有生成中文字幕` : `${episodeName} 合并完成，但没有中文字幕`,
                     message: `成片已经生成，但字幕这一步被跳过了${subWhy}。\n\n`
                         + '常见原因：这一集的音频识别不到语音，或本机缺少 ASR 模块/模型。\n'
                         + '成片本身可以正常使用；需要字幕的话，修好原因后再点一次"📦 手动合并视频"即可重烧。',

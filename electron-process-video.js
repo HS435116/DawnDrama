@@ -276,7 +276,10 @@ function runMergeScript(scriptArgs, callback, onStage) {
                     // 字幕是否真的烧上去了 (缺 ASR / 没识别到语音 / 烧录失败都会是 false)。
                     // 必须透传上去: 前端以前一律显示"已烧录中文字幕", 这就是"假成功"。
                     subtitles: parsed.result.subtitles,
-                    subtitleReason: parsed.result.subtitleReason || ''
+                    subtitleReason: parsed.result.subtitleReason || '',
+                    // 单分镜不合并 (只出字幕文件): 前端据此区分"成片"和"原片 + 字幕"
+                    merged: parsed.result.merged,
+                    subtitlePath: parsed.result.subtitlePath || ''
                 });
                 return;
             }
