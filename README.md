@@ -125,8 +125,8 @@ npm install
 3. 打包
 npm run desktop:build
 产物在 desktop-dist/：
-   晨曦短剧梦工坊-v2.8.3-便携版.exe
-   晨曦短剧梦工坊-v2.8.3-安装版.exe
+   晨曦短剧梦工坊-v2.8.4-便携版.exe
+   晨曦短剧梦工坊-安装版-v2.8.4.exe
 ```
 
 **便携模式资源路径：**
@@ -142,6 +142,7 @@ npm run desktop:build
 - **轮询终态保护**：连续 404/网络错误/超 30 分钟标记"未知"，不再永久卡"排队中"
 - **重复治理**：同标题同内容已完成视频直接复用，进度条显示"♻️ 复用"
 - **模型时长自动适配**：选模型后默认分镜时长自动取最大值（Seedance 60s / v2.5 系 12s / v2.0 系 5s）
+- **欠费阻断**：识别余额不足/配额耗尽（402 / insufficient_quota / "余额不足" 等）→ 自动暂停挂机并拦住后续提交，弹窗提示充值或换 Key；已完成片段与未完成任务连同提交参数全部保留，充值后点"重试"或"任务扫描并找回"即可接着跑
 - **VAD+ASR 字幕**：语音检测 + 噪声过滤 + 长段硬切 + 字幕烧录，全流程自动化
 
 
@@ -158,7 +159,7 @@ npm run desktop:build
 ├── electron-main.js         Electron 桌面版主进程
 ├── electron-preload.js      Electron 预加载桥
 ├── styles.css               样式
-├── package.json             项目配置（v2.8.3）
+├── package.json             项目配置（v2.8.4）
 ├── latest.json              版本更新清单
 ├── assets/                  图标资源
 ├── output/                  生成结果（不推送, gitignore）

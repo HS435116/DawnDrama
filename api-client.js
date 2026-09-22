@@ -349,6 +349,28 @@ class AgnesAPIClient {
     }
 
     /**
+     * 平台"余额不足 / 配额耗尽"(欠费)类错误。
+     * 和限流(429)的区别很关键: 限流等几分钟就好, 欠费必须充值或换 Key ——
+     * 重试多少次都一样, 所以它不能被当成"平台繁忙"去退避重试, 也不能只提示"稍后重试",
+     * 必须让用户看到真实原因并停下来 (否则整批分镜会被一个个刷成失败)。
+     * 各平台写法差异很大: HTTP 402 / insufficient_quota / insufficient balance /
+     * quota exceeded / 余额不足 / 配额已用尽 ... 这里一并覆盖。
+     */
+    static isBillingError(err) {
+        if (!err) return false;
+        const status = Number(err.status || err.statusCode || 0);
+        if (status === 402) return true;    // Payment Required: 最明确的欠费信号
+        let bodyText = '';
+        try { bodyText = err.body ? JSON.stringify(err.body) : ''; } catch (_) { /* 循环引用等, 忽略 */ }
+        const hay = `${err.message || ''} ${err.error || ''} ${err.raw || ''} ${bodyText}`;
+        if (/insufficient[_ ]?(quota|balance|funds|credit|token)|quota[_ ]?(exceeded|exhausted|depleted|reached|used up)|payment[_ ]required|billing|arrears|balance[_ ]?(is[_ ]?)?(not[_ ]?enough|insufficient|depleted|empty|zero)|credit[_ ]?(exhausted|depleted|insufficient)|账户余额|余额不足|余额为\s*0|欠费|配额(不足|耗尽|已?用尽|已?用完)|额度(不足|已用尽|耗尽)|请充值/i.test(hay)) {
+            return true;
+        }
+        // 403/429 也可能是"配额用尽"(部分平台如此表达): 再叠一层状态码 + 额度关键词的兜底
+        return (status === 403 || status === 429) && /quota|balance|credit|billing|配额|余额/i.test(hay);
+    }
+
+    /**
      * 平台"暂时忙"类错误: 限流(429) 或 排队已满(503 video queue is full / please retry later)。
      * 平台自己都说了"稍后重试", 就该退避重试, 不能当硬失败 ——
      * 否则排队高峰期一撞上, 整批分镜会被直接判死 (表现: 全部"失败: 平台生成失败(服务器内部错误)")。
@@ -357,6 +379,9 @@ class AgnesAPIClient {
     static isPlatformBusyError(err) {
         if (!err) return false;
         if (err.modelUnavailable) return false;
+        // 欠费不是"忙": 退避重试只是白等 5 分钟, 最后还给出"调大提交间隔"这种没用的建议。
+        // 必须让调用方看到真实原因 (充值/换 Key), 所以这里排除掉。
+        if (AgnesAPIClient.isBillingError(err)) return false;
         if (err.transient) return true;   // 本地服务器连不上平台 (请求未发出) 也按"稍后重试"处理
         if (AgnesAPIClient.isRateLimitError(err)) return true;
         const msg = String(err.message || '');
@@ -375,6 +400,12 @@ class AgnesAPIClient {
         const status = err && err.status;
         const has = (re) => re.test(raw);
 
+        // 欠费/配额耗尽: 必须排在"限流"与"密钥无效"之前 ——
+        // 403/429 也可能表示额度耗尽, 先判就会给出"稍后重试/换密钥"这种误导性的建议,
+        // 用户照着做半天也跑不起来 (真正该做的是充值或换 Key)。
+        if (!(err && (err.networkError || err.proxyUnreachable)) && AgnesAPIClient.isBillingError(err)) {
+            return '平台账户余额不足/配额已用尽（欠费）：请到对应平台充值，或在「模型设置」更换可用的 API Key / 模型';
+        }
         // 本地服务器连不上平台 (DNS 解析不到 / 连接被拒 / 连接超时):
         // 这时本地服务器是好的, 是"到平台的网络"有问题, 别提示成"本地服务器没运行"。
         if (has(/代理请求失败|代理请求超时|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|UND_ERR_CONNECT_TIMEOUT|ETIMEDOUT/i)) {

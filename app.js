@@ -16,7 +16,7 @@
  */
 
 // ================= 版本信息 =================
-const APP_VERSION = '2.8.3';
+const APP_VERSION = '2.8.4';
 // 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date"})
 // 发布新版本时的检查清单:
 //   1) bump 本文件的 APP_VERSION、package.json 的 version、server.js 的 APP_VERSION
@@ -69,6 +69,13 @@ class AgnesVideoGenerator {
         this._llmModelsKey = null;      // 上面这份列表对应的来源标识
         this._llmModelsFetchedAt = 0;   // 拉取时间 (5 分钟内不重复拉)
         this._llmFetching = false;      // 正在拉取中 (防止并发重复请求)
+
+        // 平台欠费(余额不足/配额耗尽)阻断状态: 文本模型与视频模型共用一套。
+        // 欠费时重试没有意义 —— 只会把每个分镜都刷成"失败"、把挂机时间白耗掉,
+        // 所以记住状态: ① 只提醒一次 ② 后续提交直接短路 ③ 充值后一键解除。
+        this._billingBlocked = false;
+        this._billingError = null;      // 触发阻断的错误 (提醒里要展示平台原话)
+        this._billingKind = null;       // 'text' (剧本/分镜AI) | 'video' (视频模型)
 
         // 网络状态与"挂机等网络"的等待者
         this._online = (typeof navigator === 'undefined' || navigator.onLine !== false);
@@ -363,6 +370,11 @@ class AgnesVideoGenerator {
 
     async startGeneration() {
         if (this.isGenerating) return this.showStatus('已有任务在生成中，请等待完成或点击停止', 'error');
+
+        // 平台欠费时先提醒充值: 提交上去也只会被拒, 白跑一遍还把分镜刷成失败
+        if (this._billingBlocked) {
+            return this.showBillingAlert(this._billingError, this._billingKind || 'video');
+        }
 
         const title = document.getElementById('title').value.trim();
         const mainPrompt = document.getElementById('prompt').value.trim();
@@ -759,10 +771,13 @@ class AgnesVideoGenerator {
         // 前序任务触发限流时，不再提交新任务 (已提交的任务监控不受影响)
         if (this.haltSubmissions) {
             record.status = 'failed';
-            record.error = '前序任务触发平台限流，本任务未提交。请稍后在作品库点击"重试"';
+            // 欠费与限流都会拦住提交, 但原因完全不同: 提示必须说实话, 否则用户会照着限流的建议白等
+            record.error = this._billingBlocked
+                ? '平台账户欠费（余额不足/配额耗尽），本任务未提交。记录与提交参数已保留，充值后点"重试"即可'
+                : '前序任务触发平台限流，本任务未提交。请稍后在作品库点击"重试"';
             record.finishedAt = Date.now();
             this.saveHistory(); this.renderGallery();
-            this.updateProgressItem(record.id, progressLabel, '⏸️ 因限流保护未提交', 'failed');
+            this.updateProgressItem(record.id, progressLabel, this._billingBlocked ? '💳 因平台欠费未提交' : '⏸️ 因限流保护未提交', 'failed');
             
             return 'failed';
         }
@@ -887,15 +902,22 @@ class AgnesVideoGenerator {
             // 用户点了"停止": 不算失败, 标记为已停止 (有平台任务 ID 的可用"任务扫描"找回)
             if (error && error.cancelled) return this._markRecordStopped(record, progressLabel);
             console.error(`❌ 任务 ${progressLabel} 提交失败:`, error);
+            const billing = this.isBillingError(error);
             record.status = 'failed';
-            record.error = AgnesAPIClient.isPlatformBusyError(error)
-                ? '平台繁忙：已自动退避重试多次仍被拒绝。建议把「模型设置 → 高级参数 → 提交间隔」调大 (如 10~30 秒) 或分小批生成，然后点"重试"'
-                : AgnesAPIClient.friendlyError(error);
+            record.error = billing
+                ? '平台账户欠费（余额不足/配额耗尽），本任务未提交。记录与提交参数已保留，充值后点"重试"即可'
+                : (AgnesAPIClient.isPlatformBusyError(error)
+                    ? '平台繁忙：已自动退避重试多次仍被拒绝。建议把「模型设置 → 高级参数 → 提交间隔」调大 (如 10~30 秒) 或分小批生成，然后点"重试"'
+                    : AgnesAPIClient.friendlyError(error));
             record.errorTech = error.message;
             record.finishedAt = Date.now();
             this.saveHistory();
             this.renderGallery();
-            this.updateProgressItem(record.id, progressLabel, `❌ 失败: ${record.error}`, 'failed');
+            this.updateProgressItem(record.id, progressLabel,
+                billing ? '💳 失败: 平台欠费，本任务未提交' : `❌ 失败: ${record.error}`, 'failed');
+            // 欠费: 弹窗提醒 + 暂停挂机 + 拦住后续提交。
+            // 放在批次循环里最关键 —— 否则剩下的分镜会一个一个撞同一堵墙, 挨个变成"失败", 挂机时间全白耗。
+            if (billing) this.showBillingAlert(error, 'video');
             if (AgnesAPIClient.isPlatformBusyError(error)) {
                 // 只阻止后续新提交，绝不打断已提交任务的监控
                 this.haltSubmissions = true;
@@ -967,14 +989,21 @@ class AgnesVideoGenerator {
                 }
 
                 if (st.status === 'failed') {
+                    const platErr = st.error ? String(st.error) : '';
+                    const billing = platErr && this.isBillingError({ message: platErr });
                     record.status = 'failed';
-                    record.error = st.error
-                        ? AgnesAPIClient.friendlyError({ message: String(st.error), status: 500 })
-                        : '平台返回任务失败';
+                    record.error = billing
+                        ? '平台账户欠费（余额不足/配额耗尽），平台侧已判失败。记录与提交参数已保留，充值后点"重试"即可'
+                        : (platErr
+                            ? AgnesAPIClient.friendlyError({ message: platErr, status: 500 })
+                            : '平台返回任务失败');
                     record.errorTech = st.error || '';
                     record.finishedAt = Date.now();
                     this.saveHistory(); this.renderGallery();
-                    this.updateProgressItem(record.id, progressLabel, `❌ 平台返回失败: ${record.error}`, 'failed');
+                    this.updateProgressItem(record.id, progressLabel,
+                        billing ? '💳 平台欠费，任务被判失败' : `❌ 平台返回失败: ${record.error}`, 'failed');
+                    // 平台因为欠费把任务判死: 整批都会这样, 立刻停下来提醒, 别把剩下的一起耗掉
+                    if (billing) this.showBillingAlert({ message: platErr }, 'video');
                     return 'failed';
                 }
 
@@ -983,6 +1012,17 @@ class AgnesVideoGenerator {
             } catch (error) {
                 // 用户点了"停止"导致请求被中断: 按停止处理, 不计入轮询错误
                 if (error && error.cancelled) return this._markRecordStopped(record, progressLabel);
+                // 欠费: 轮询再多次也一样 —— 别空转到 10 次连续错误才放弃, 立即停下提醒并保留任务
+                // (状态记"未知"而不是"失败": 平台任务本身可能还在, 任务ID保留着, 充值后扫描即可继续查)
+                if (this.isBillingError(error)) {
+                    record.status = 'unknown';
+                    record.error = '平台账户欠费（余额不足/配额耗尽），暂时查不到进度。任务记录已保留，充值后点"任务扫描并找回"即可继续';
+                    record.errorTech = error.message;
+                    this.saveHistory(); this.renderGallery();
+                    this.updateProgressItem(record.id, progressLabel, '💳 平台欠费，已暂停查询 (任务已保留)', 'failed');
+                    this.showBillingAlert(error, 'video');
+                    return 'unknown';
+                }
                 // 轮询与提交共享平台配额: 查询触发 429/503(排队已满) 时全局退避, 不计入连续错误
                 if (AgnesAPIClient.isPlatformBusyError(error)) {
                     this.apiClient._rlUntil = Math.max(this.apiClient._rlUntil || 0, Date.now() + 30000);
@@ -1387,6 +1427,10 @@ class AgnesVideoGenerator {
         }
 
         if (!this.apiClient) return this.showStatus('未配置 API，无法重试', 'error');
+        // 平台欠费时重试必然失败: 先提醒充值, 别把任务状态从"未知"刷成"失败" (状态一换, 找回时更容易被漏掉)
+        if (this._billingBlocked) {
+            return this.showBillingAlert(this._billingError, this._billingKind || 'video');
+        }
         // 单独重试是一次新的用户动作: 解除上一批次的限流保护与停止标记,
         // 否则点完"停止"后再点重试会被上一次的 stopRequested 立刻取消掉。
         if (!this.isGenerating) { this.haltSubmissions = false; this.stopRequested = false; }
@@ -1457,6 +1501,11 @@ class AgnesVideoGenerator {
     async scanTasks() {
         if (this._scanning) return this.showStatus('⚠️ 扫描正在进行中，请稍候', 'warning');
 
+        // 平台欠费时先提醒充值: 找回出来的任务也提交不上去, 扫一遍只是白跑
+        if (this._billingBlocked) {
+            return this.showBillingAlert(this._billingError, this._billingKind || 'video');
+        }
+
         // 扫描进度条与"未完成任务"面板都在"批量生成"页: 先切过去,
         // 否则用户在短剧工坊页点"任务扫描并找回"会看不到任何反馈。
         this.switchTab('generate');
@@ -1484,6 +1533,9 @@ class AgnesVideoGenerator {
         const scanBtn = document.getElementById('scan-btn');
         if (scanBtn) { scanBtn.disabled = true; scanBtn.textContent = '🔍 扫描中...'; }
         this.setScanProgress(2, `正在分析 ${pending.length} 个任务...`);
+
+        // 本次补全取回视频的集名, 扫完按集合并成片 (在 try 之外声明: 后面 finally 之后还要用它)
+        const recoveredTitles = new Set();
 
         try {
             // ---------- 阶段 1: 合并重复内容 ----------
@@ -1521,7 +1573,6 @@ class AgnesVideoGenerator {
             if (toCheck.length > 0) await this.delay(400); // 让用户看清阶段结果
 
             let completed = 0, failed = 0, stillRunning = 0, checked = 0;
-            const recoveredTitles = new Set();   // 本次补全取回视频的集, 稍后判断是否需要合并
             if (this.apiClient) {
                 for (const taskId of toCheck) {
                     checked++;
@@ -3926,16 +3977,104 @@ class AgnesVideoGenerator {
     async seriesChat(userPrompt) {
         const client = this.llmClient();
         if (!client) throw new Error('尚未配置剧本AI文本模型 (模型设置 → 剧本AI)');
-        const content = await client.chat([
-            { role: 'system', content: '你是一名专业短剧编剧兼分镜师，为AI文生视频工具编写分镜提示词。无论被要求什么，你都只输出一个JSON对象，禁止输出JSON以外的解释文字。JSON 字符串值内部禁止出现未转义的英文双引号 " —— 对白引用一律使用中文引号「」，以保证 JSON 合法。' },
-            { role: 'user', content: userPrompt }
-        ], { temperature: 0.8, maxTokens: 16384 });
+        let content;
+        try {
+            content = await client.chat([
+                { role: 'system', content: '你是一名专业短剧编剧兼分镜师，为AI文生视频工具编写分镜提示词。无论被要求什么，你都只输出一个JSON对象，禁止输出JSON以外的解释文字。JSON 字符串值内部禁止出现未转义的英文双引号 " —— 对白引用一律使用中文引号「」，以保证 JSON 合法。' },
+                { role: 'user', content: userPrompt }
+            ], { temperature: 0.8, maxTokens: 16384 });
+        } catch (e) {
+            // 欠费/配额耗尽: 弹窗提醒 + 暂停挂机 + 拦住后续提交 (重试没有意义, 必须让用户去充值或换 Key)
+            if (this.isBillingError(e)) this.showBillingAlert(e, 'text');
+            throw e;
+        }
+        // 这一轮调用成功了: 说明额度已经恢复, 顺手解除之前的欠费阻断, 免得用户还得手动点一次
+        if (this._billingBlocked && this._billingKind === 'text') this._clearBillingBlock('text');
         const obj = AgnesAPIClient.extractJson(content);
         if (!obj) {
             const c = String(content);
             throw new Error(`剧本AI未返回有效JSON (共${c.length}字，可能因输出长度被截断)。末尾内容: …${c.slice(-100)}`);
         }
         return obj;
+    }
+
+    /**
+     * 是否属于平台欠费 (余额不足/配额耗尽)。
+     * 文本模型与视频模型共用同一套判定 (见 AgnesAPIClient.isBillingError)。
+     */
+    isBillingError(e) {
+        return AgnesAPIClient.isBillingError(e);
+    }
+
+    /**
+     * 欠费阻断式提醒 (文本模型/视频模型共用)。
+     * 做四件事:
+     *  1. 暂停挂机 + 拦住后续提交 —— 欠费时继续提交只会把每个分镜逐个刷成"失败", 白等还丢进度;
+     *  2. 弹窗说明是"哪一类模型"欠费, 并附上平台原话 (便于用户去平台核对);
+     *  3. 给出"我已充值重新检查 / 去模型设置 / 稍后再说"的下一步;
+     *  4. 记住状态, 避免每次轮询都重复弹。
+     * 任务不会因为欠费丢失: 记录连同提交参数与平台任务ID 都还在本地,
+     * 充值后点单条"重试"或"🔍 任务扫描并找回"就能接着跑 (已生成完成的直接取回, 不重复消耗)。
+     * @param {Error|object} err 触发阻断的错误 (可为 {message} 形式)
+     * @param {'text'|'video'} kind 欠费的是剧本AI文本模型还是视频模型
+     */
+    showBillingAlert(err, kind = 'text') {
+        this._billingBlocked = true;
+        this._billingError = err || this._billingError;
+        this._billingKind = kind;
+
+        // 暂停挂机: 否则循环会继续跑下一集, 把整集分镜挨个刷成失败
+        if (this._autoRunning && !this._autoPaused) {
+            this._autoPaused = true;
+            this.saveRunState({ active: true, paused: true, phase: 'paused' });
+            this.showAutoRunControls(true);
+        }
+        // 拦住后续新提交 (已提交到平台的任务照常监控, 该跑完的跑完并取回)
+        this.haltSubmissions = true;
+
+        const isText = kind !== 'video';
+        const what = isText ? '文本AI模型（剧本/分镜）' : '视频模型';
+        const msg = String((err && (err.message || err.error)) || '平台返回余额不足/配额耗尽');
+
+        this.notifyAttention({
+            key: 'billing-blocked:' + kind,      // 同一次欠费只弹一个框, 不反复弹
+            title: isText ? '💳 文本AI模型余额不足' : '💳 视频模型余额不足/配额耗尽',
+            message: `${what}返回"余额不足 / 配额耗尽"，已暂停后续提交。\n\n`
+                + `平台返回：${msg}\n\n`
+                + '已自动暂停挂机与后续任务提交，避免继续无效重试白耗时间。\n'
+                + '已提交到平台的任务会照常生成完成并取回，不需要重新生成。\n\n'
+                + (isText
+                    ? '请到对应平台充值，或在「模型设置 → 剧本AI」更换可用的 API Key / 模型 ID。'
+                    : '请到对应平台充值，或在「模型设置」更换可用的 API Key / 模型 ID。')
+                + '\n已完成的片段与未完成任务全部保留，充值后点它们的"重试"，或点"🔍 任务扫描并找回"即可接着跑。',
+            level: 'error',
+            tab: 'models',
+            actions: [
+                {
+                    text: '🔁 我已充值，重新检查',
+                    cls: 'btn-primary',
+                    run: () => {
+                        this._clearBillingBlock(kind);
+                        this.showStatus('✅ 已解除欠费阻断，可重新尝试生成或"任务扫描并找回"', 'success');
+                        if (isText) this.fetchLlmModels({ force: true }).catch(() => {});
+                    }
+                },
+                { text: '⚙️ 去模型设置', cls: 'btn-secondary', run: () => this.switchTab('models') },
+                { text: '稍后再说', cls: 'btn-secondary', run: () => {} },
+            ],
+        });
+    }
+
+    /**
+     * 解除欠费阻断: 用户点了"我已充值", 或某次调用成功 (证明额度确实恢复了)。
+     * @param {'text'|'video'} [kind] 只解除该类型的阻断; 省略则全部解除
+     */
+    _clearBillingBlock(kind) {
+        if (kind && this._billingKind && kind !== this._billingKind) return;
+        this._billingBlocked = false;
+        this._billingError = null;
+        this._billingKind = null;
+        this.haltSubmissions = false;
     }
 
     /**
@@ -3946,6 +4085,10 @@ class AgnesVideoGenerator {
     llmErrorHint(e) {
         if (!e) return '';
         let out = e.hint ? '\n💡 ' + e.hint : '';
+        // 欠费: 重试没意义, 直接说清该做什么, 别让用户对着"服务器内部错误"反复点重试
+        if (this.isBillingError(e)) {
+            out += '\n💳 文本AI模型余额不足/配额耗尽 (欠费)：请到对应平台充值，或在「模型设置 → 剧本AI」更换可用的 API Key / 模型 ID。';
+        }
         if (e.modelUnavailable && Array.isArray(this.availableModels) && this.availableModels.length) {
             out += '\n可用模型示例: ' + this.availableModels.slice(0, 8).join('、')
                 + (this.availableModels.length > 8 ? ` …(共 ${this.availableModels.length} 个)` : '');
@@ -4854,6 +4997,13 @@ ${previous}${lastCliff}
         const autoResume = !!opts.autoResume;   // 由"刷新/断网后按落盘痕迹恢复"调用: 不再弹确认框
         if (this._autoRunning) return this.setSeriesStatus('⚠️ 全剧自动生成已在运行中', 'error');
         if (this.isGenerating) return this.setSeriesStatus('⚠️ 已有任务在生成中，请等待完成后再启动全剧生成', 'error');
+
+        // 平台欠费时先提醒充值: 挂机会一集一集地撞同一堵墙, 把整剧分镜全刷成"失败"
+        // (进度与已完成的片段都保留着, 充值后接着跑即可)
+        if (this._billingBlocked) {
+            this.setSeriesStatus('💳 平台欠费（余额不足/配额耗尽），全剧生成已暂停。充值后点"🔁 我已充值，重新检查"再继续', 'error');
+            return this.showBillingAlert(this._billingError, this._billingKind || 'video');
+        }
         if (!this.llmClient()) {
             this.switchTab('models');
             return this.showStatus('⚠️ 请先在"模型设置 → 剧本AI"配置文本模型 ID', 'error');

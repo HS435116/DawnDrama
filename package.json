@@ -1,6 +1,6 @@
 {
   "name": "agnes-2.5-video-generator",
-  "version": "2.8.3",
+  "version": "2.8.4",
   "description": "晨曦短剧梦工坊 - 多平台AI短剧批量制作工具",
   "main": "electron-main.js",
   "scripts": {
@@ -21,6 +21,7 @@
     "test:net": "node tests/network-failures.test.js",
     "test:dl": "node tests/download-segments.test.js",
     "test:update": "node tests/update-source.test.js",
+    "test:billing": "node tests/billing-block.test.js",
     "dev": "nodemon server.js",
     "free-port": "node free-port.js 3000",
     "package": "pkg . --out-path dist",
