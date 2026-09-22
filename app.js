@@ -16,7 +16,7 @@
  */
 
 // ================= 版本信息 =================
-const APP_VERSION = '2.8.5';
+const APP_VERSION = '2.8.6';
 // 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date"})
 // 发布新版本时的检查清单:
 //   1) bump 本文件的 APP_VERSION、package.json 的 version、server.js 的 APP_VERSION
@@ -861,6 +861,10 @@ class AgnesVideoGenerator {
                 onRateLimitWait: (ms, n, total) =>
                     this.updateProgressItem(record.id, progressLabel, `⏳ 平台限流，${Math.round(ms / 1000)}s 后自动重试提交 (${n}/${total})`, 'waiting')
             };
+            // 参考图: 由 api-client 按平台文档生成字段 (Agnes 2.5 系: mode=reference + images[],
+            // 或 mode=keyframe + first_frame; v2.0 系: image / extra_body.image)。
+            // 有参考图才带图, 没参考图就是纯文生视频 —— 调用方式见「模型设置 → 参考图调用方式」。
+            subOpts.refImageMode = this.settings.refImageMode || 'reference';
             if (req.refImages && req.refImages.length > 0) {
                 subOpts.image_urls = req.refImages.map(url => ({ url, role: 'first_frame' }));
             }
@@ -877,16 +881,26 @@ class AgnesVideoGenerator {
             if (fixedModel) record.fixedDurationNote = true;
 
             record.apiTaskId = sub.taskId;
+            // AGNES 创建任务同时返回 video_id: 非 text 模式 (参考图/首帧) 官方推荐用它查询
+            record.apiVideoId = sub.videoId || record.apiVideoId || null;
+            record.submitMode = sub.mode || record.submitMode || '';
+            record.submitModel = (sub.raw && sub.raw.model) ? String(sub.raw.model) : (this.settings.modelName || '');
+            record.refImageCount = sub.refImageCount || 0;
             record.status = sub.status === 'succeeded' ? 'running' : sub.status;
             // 平台已接收: 清掉之前留下的旧原因 (限流等待期间的僵尸判定/上一次失败的原因)
             record.error = null;
             record.errorTech = null;
             this.renderGallery();
             this.saveHistory();
+            // 提交说明: 带上本次生成方式 (文生/参考图/首帧) 与平台对参数的收敛 (v2.0 固定 5s/4:3、Flash 只收 720P)
+            const modeNote = sub.refImageCount
+                ? ` · ${sub.mode === 'keyframe' ? '首帧图生视频' : '参考图生成'} ${sub.refImageCount} 张`
+                : (sub.mode === 'text' || !sub.mode ? ' · 文生视频' : '');
+            const clampNote = sub.sizeClamped ? ' · 该模型仅支持 720P，已按 720P 提交' : '';
             this.updateProgressItem(record.id, progressLabel,
                 fixedModel
                     ? `⚠️ 已提交，但当前模型 (v2.0) 固定输出 5 秒/4:3，设定 ${req.duration}s 不生效；如需 8/12 秒竖屏请切换 agnes-video-2.5-flash`
-                    : `✅ 已提交 (任务ID: ${sub.taskId}${snapped ? `, 时长档位 ${req.duration}s→${sub.durationSent}s` : ''})`,
+                    : `✅ 已提交 (任务ID: ${sub.taskId}${modeNote}${snapped ? `, 时长档位 ${req.duration}s→${sub.durationSent}s` : ''}${clampNote})`,
                 'running');
 
             if (sub.videoUrl) {
@@ -931,6 +945,21 @@ class AgnesVideoGenerator {
 
     /* ================= 轮询监控 (核心修复) ================= */
 
+    /**
+     * 查询任务时带的参数: AGNES 的非 text 模式 (参考图/首帧) 官方推荐用 video_id + model_name 查询
+     * (文档明确"仅 video_id"的形式只适用于 text 模式), 所以把提交时记下的 video_id / 模型 / 模式
+     * 传给客户端, 由它决定查询路径的优先顺序; text 模式维持原有顺序不动。
+     */
+    _queryOptsOf(record) {
+        if (!record) return {};
+        const mode = record.submitMode || '';
+        return {
+            videoId: record.apiVideoId || '',
+            model: record.submitModel || '',
+            preferVideoId: !!record.apiVideoId && !!mode && mode !== 'text'
+        };
+    }
+
     async monitorTask(record, progressLabel = '') {
         this._activeJobs.add(record.id);
         try {
@@ -959,7 +988,7 @@ class AgnesVideoGenerator {
             }
 
             try {
-                const st = await this.apiClient.queryTask(record.apiTaskId);
+                const st = await this.apiClient.queryTask(record.apiTaskId, this._queryOptsOf(record));
                 consecutiveErrors = 0;
                 notFoundErrors = 0;
 
@@ -1577,8 +1606,8 @@ class AgnesVideoGenerator {
                 for (const taskId of toCheck) {
                     checked++;
                     try {
-                        const st = await this.apiClient.queryTask(taskId);
                         const group = byTask.get(taskId);
+                        const st = await this.apiClient.queryTask(taskId, this._queryOptsOf(group[0]));
                         if (st.status === 'succeeded' && st.videoUrl) {
                             for (const rec of group) {
                                 rec.urlNeedsAuth = !!st.videoUrlNeedsAuth;
@@ -2331,6 +2360,8 @@ class AgnesVideoGenerator {
             if (!latest) throw new Error('清单缺少 version 字段');
             const info = { version: latest, notes: String(manifest.notes || ''), url: String(manifest.url || ''), date: String(manifest.date || '') };
             this._updateInfo = info;
+            // 把清单里的 history (+当前这条) 并进"最近 5 条版本记录", 供版本更新页长期展示 (离线也在)
+            this._mergeUpdateHistory(manifest, info);
             const isNew = this.compareVersions(latest, APP_VERSION) > 0;
             const tab = document.getElementById('update-tab');
             if (isNew) {
@@ -2401,7 +2432,65 @@ class AgnesVideoGenerator {
                 '· 新版本发布后，顶部"🔄 版本更新"入口会闪烁提醒并弹窗一次；下载新执行文件替换旧文件即完成升级，<b>作品、剧本存档与设置全部保留</b>。<br>' +
                 '· 最新版本可在 <a href="' + PROJECT_HOMEPAGE + '" target="_blank" rel="noopener" style="color: var(--primary-color);">项目主页</a> 获取。<br>' +
                 '· 版权所有 © 2026  晨曦微光工作室</p>' +
+            '</div>' +
+            this.updateHistorySection();
+    }
+
+    /**
+     * 版本更新页的"历史版本更新记录"区块 (保留最近 5 条)。
+     * 记录来源: 更新清单 latest.json 的 history 数组 —— 清单里没有/离线时用上次缓存,
+     * 缓存也没有就退化成本次清单这一条 (fresh 安装也能看到当前版本说明)。
+     */
+    updateHistorySection() {
+        let list = this._cachedUpdateHistory();
+        if (list.length === 0 && this._updateInfo) list = this._mergeUpdateHistory({ history: [] }, this._updateInfo);
+        const rows = list.length
+            ? list.map(h => {
+                const cur = h.version === APP_VERSION;
+                return '<details class="update-history-item"' + (cur ? ' open' : '') + '>' +
+                    '<summary><b>v' + this.escapeHtml(h.version) + '</b>' +
+                    (h.date ? ' <span class="update-history-date">(' + this.escapeHtml(h.date) + ')</span>' : '') +
+                    (cur ? ' <span class="update-history-cur">当前版本</span>' : '') + '</summary>' +
+                    '<div class="update-history-notes">' + this.escapeHtml(h.notes || '（该版本未记录更新说明）') + '</div>' +
+                    '</details>';
+            }).join('')
+            : '<p style="color: var(--text-muted); font-size: 0.9rem; margin: 0;">暂无可显示的版本记录。联网点一次"🔍 检查更新"即可拉取并缓存最近 5 条（离线时也能继续查看）</p>';
+        return '<div class="settings-section">' +
+                '<h3>📜 历史版本更新记录 <span style="font-weight: 400; font-size: 0.85rem; color: var(--text-muted);">（保留最近 5 条）</span></h3>' +
+                rows +
             '</div>';
+    }
+
+    /** 把更新清单的 history (+当前这条) 合并进"最近 5 条"缓存: 按版本号倒序去重, 只留 5 条 */
+    _mergeUpdateHistory(manifest, info) {
+        const raw = Array.isArray(manifest && manifest.history) ? manifest.history.slice() : [];
+        raw.push(info || { version: manifest && manifest.version, notes: manifest && manifest.notes, date: manifest && manifest.date });
+        const seen = new Set();
+        const out = [];
+        for (const it of raw) {
+            const v = String((it && it.version) || '').trim();
+            if (!v || seen.has(v)) continue;   // 同一个版本只留第一条 (清单里的完整说明优先)
+            seen.add(v);
+            out.push({ version: v, date: String((it && it.date) || ''), notes: String((it && it.notes) || '') });
+        }
+        out.sort((a, b) => this.compareVersions(b.version, a.version));
+        const top = out.slice(0, 5);
+        this._updateHistory = top;
+        try { localStorage.setItem('agnes_update_history', JSON.stringify(top)); } catch (_) { /* 隐私模式等, 忽略 */ }
+        return top;
+    }
+
+    /** 读取"最近 5 条版本记录"缓存 (内存 -> localStorage -> 空) */
+    _cachedUpdateHistory() {
+        if (Array.isArray(this._updateHistory) && this._updateHistory.length) return this._updateHistory;
+        try {
+            const cached = JSON.parse(localStorage.getItem('agnes_update_history') || '[]');
+            if (Array.isArray(cached) && cached.length) {
+                this._updateHistory = cached.slice(0, 5);
+                return this._updateHistory;
+            }
+        } catch (_) { /* 缓存损坏, 忽略 */ }
+        return [];
     }
 
     formatElapsed(ms) {
@@ -3485,6 +3574,7 @@ class AgnesVideoGenerator {
         set('custom-poll-path', s.customPollPath);
         set('custom-result-path', s.customResultPath);
         set('seed', s.seed);
+        set('ref-image-mode', s.refImageMode || 'reference');
         set('submit-interval', s.submitIntervalSec ?? 2);
         set('llm-endpoint', s.llmEndpoint);
         set('llm-key', s.llmApiKey);
@@ -3808,6 +3898,7 @@ class AgnesVideoGenerator {
             customResultPath: document.getElementById('custom-result-path').value.trim(),
             seed: document.getElementById('seed').value ? parseInt(document.getElementById('seed').value) : null,
             submitIntervalSec: Math.max(0, parseFloat(document.getElementById('submit-interval').value) || 0),
+            refImageMode: document.getElementById('ref-image-mode')?.value || 'reference',
             llmSameAsVideo: document.getElementById('llm-same-creds')?.checked !== false,
             llmEndpoint: document.getElementById('llm-endpoint')?.value.trim() || '',
             llmApiKey: document.getElementById('llm-key')?.value.trim() || '',
@@ -3886,7 +3977,10 @@ class AgnesVideoGenerator {
             llmModel: '',
             basePath: '', // 留空: 实际保存位置由服务器 outputDir 决定 (模型设置中可自定义)
             autoCreateFolder: true,
-            keepOriginal: true
+            keepOriginal: true,
+            // 参考图调用方式 (模型设置里可选): reference=参考图生成 / keyframe=首帧图生视频 / off=不使用参考图。
+            // 分镜带参考图时自动切成图生视频, 没带参考图则自动文生视频
+            refImageMode: 'reference'
         };
     }
 

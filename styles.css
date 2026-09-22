@@ -798,6 +798,40 @@ small {
     margin: 15px 0;
 }
 
+/* 版本更新页: 历史版本更新记录 (保留最近 5 条) */
+.update-history-item {
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    background: var(--card-bg, transparent);
+}
+.update-history-item > summary {
+    cursor: pointer;
+    font-size: 0.95rem;
+    outline: none;
+}
+.update-history-item > summary:hover { color: var(--primary-color); }
+.update-history-date { color: var(--text-muted); font-weight: 400; font-size: 0.85rem; }
+.update-history-cur {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 0.75rem;
+    background: var(--primary-color);
+    color: #fff;
+}
+.update-history-notes {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border-color);
+    font-size: 0.88rem;
+    line-height: 1.75;
+    color: var(--text-color);
+    white-space: pre-wrap;
+}
+
 .info-row {
     display: flex;
     justify-content: space-between;

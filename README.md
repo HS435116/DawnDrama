@@ -125,8 +125,8 @@ npm install
 3. 打包
 npm run desktop:build
 产物在 desktop-dist/：
-   晨曦短剧梦工坊-v2.8.5-便携版.exe
-   晨曦短剧梦工坊-安装版-v2.8.5.exe
+   晨曦短剧梦工坊-v2.8.6-便携版.exe
+   晨曦短剧梦工坊-安装版-v2.8.6.exe
 ```
 
 **便携模式资源路径：**
@@ -144,6 +144,8 @@ npm run desktop:build
 - **模型时长自动适配**：选模型后默认分镜时长自动取最大值（Seedance 60s / v2.5 系 12s / v2.0 系 5s）
 - **欠费阻断**：识别余额不足/配额耗尽（402 / insufficient_quota / "余额不足" 等）→ 自动暂停挂机并拦住后续提交，弹窗提示充值或换 Key；已完成片段与未完成任务连同提交参数全部保留，充值后点"重试"或"任务扫描并找回"即可接着跑
 - **停止即结束本次全部任务**：点"停止挂机"会中断在途请求 + 收尾排队/生成中的任务 + 清掉进度记录（下次打开不再提示续跑）；"清除剧本任务"先弹对话框由用户选择是否停止全部剧本任务，清除后不留运行记录。任务记录与已保存的视频都不会被删
+- **参考图自动图生视频**：分镜带参考图就走图生视频、没带就自动文生视频，无需手动切换（模型设置 → 参考图调用方式：参考图生成 / 首帧图生视频 / 不使用）。字段按各平台官方文档下发 —— Agnes Video 2.5 系 `mode=reference`+`images`（Flash 最多 5 张）或 `mode=keyframe`+`first_frame`，Agnes v2.0 单图 `image`、多图 `extra_body.image`+`keyframes`，火山方舟 Seedance 在 `content` 里带 `role`（first_frame/last_frame/reference_image）；其他聚合站字段名不统一，程序按候选逐个试并记住平台接受的那个；自定义 JSON 平台可用 `{{image_urls_json}}` / `{{image_url}}` / `{{mode}}` 自行拼接
+- **版本更新记录**：版本更新页保留最近 5 条版本说明（读更新清单 latest.json 的 `history`，离线用本地缓存）
 - **VAD+ASR 字幕**：语音检测 + 噪声过滤 + 长段硬切 + 字幕烧录，全流程自动化
 
 
@@ -160,7 +162,7 @@ npm run desktop:build
 ├── electron-main.js         Electron 桌面版主进程
 ├── electron-preload.js      Electron 预加载桥
 ├── styles.css               样式
-├── package.json             项目配置（v2.8.5）
+├── package.json             项目配置（v2.8.6）
 ├── latest.json              版本更新清单
 ├── assets/                  图标资源
 ├── output/                  生成结果（不推送, gitignore）

@@ -396,6 +396,18 @@
                                 <small>可点击下方"拉取模型列表"后选择，或直接输入任意自定义模型 ID<br>
                                 ⚠️ AGNES v2.0 系模型固定输出 5 秒/4:3（时长与比例参数不生效）；需要 8/12 秒竖屏请选 agnes-video-2.5-flash 或火山方舟 Seedance</small>
                             </div>
+
+                            <div class="form-group">
+                                <label for="ref-image-mode">🖼️ 参考图调用方式</label>
+                                <select id="ref-image-mode">
+                                    <option value="reference">参考图生成（mode=reference，推荐）</option>
+                                    <option value="keyframe">首帧图生视频（mode=keyframe）</option>
+                                    <option value="off">不使用参考图（始终文生视频）</option>
+                                </select>
+                                <small id="ref-image-hint">分镜带参考图时自动切换成图生视频，没带参考图则自动用文生视频（无需手动改）<br>
+                                · <b>参考图生成</b>：把参考图当"人物/风格参考"（Agnes Video 2.5 系最多 5 张，v2.0 系单图走 image、多图走关键帧）；提示词里可用 &lt;Picture 1&gt; 指代第 1 张参考图<br>
+                                · <b>首帧图生视频</b>：取第一张参考图当首帧，画面从这张图开始动（只用到 1 张图）</small>
+                            </div>
                         </div>
 
                         <div class="form-group" id="custom-json-group" style="display: none;">
@@ -518,7 +530,7 @@
         <footer class="footer">
             <p>晨曦短剧梦工坊 | 多平台批量视频制作工具</p>
             <p id="connection-status">状态: 检测中...</p>
-           <p><a href="javascript:void(0)" onclick="showVersionInfo()" title="点击查看本版本功能介绍" style="color: var(--primary-color); font-weight: 600;">v<span id="footer-version">2.8.5</span></a> · 2026  晨曦微光工作室 </p>
+           <p><a href="javascript:void(0)" onclick="showVersionInfo()" title="点击查看本版本功能介绍" style="color: var(--primary-color); font-weight: 600;">v<span id="footer-version">2.8.6</span></a> · 2026  晨曦微光工作室 </p>
         </footer>
     </div>
 

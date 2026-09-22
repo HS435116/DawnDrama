@@ -17,6 +17,15 @@
  *  5. 自定义平台: 自定义 JSON 请求体 + 自定义查询路径 + 自定义结果取值路径
  */
 
+// ================= 图生视频字段协商 =================
+// 各聚合站的"参考图/首帧"字段名五花八门 (image_urls / images / image / first_frame / input_reference ...),
+// 没法在代码里穷举每个平台, 于是做"试一次就记住":
+//   ① 按候选顺序先发第一个; ② 平台若回 400 "xxx is not an allowed request field",
+//   就把该字段拉黑、换下一个候选立刻重试; ③ 结论按 "平台|端点|模型" 落 localStorage,
+//   之后的任务直接发对的字段 —— 用户不需要改任何设置, 也适用于将来新增的平台。
+const IMAGE_FIELD_STORE_KEY = 'agnes_image_field_map';
+const IMAGE_FIELD_NAMES = ['images', 'image_urls', 'image', 'image_url', 'first_frame', 'last_frame', 'input_reference'];
+
 class AgnesAPIClient {
     constructor(settings) {
         this.settings = settings || {};
@@ -221,33 +230,78 @@ class AgnesAPIClient {
         const ratio = opts.ratio || '16:9';
 
         let url, body, sentDuration = duration;
+        let refUsed = 0;        // 本次实际带上的参考图张数 (0 = 文生视频)
+        let sizeClamped = false; // size 是否被模型限制收敛过 (Flash 只接受 720P)
+        let imageIntent = 'reference';   // 参考图意图 (reference 参考图 / keyframe 首帧), 决定字段候选顺序
+        let appliedImageField = '';      // 本次实际发出去的图字段名 (用于协商)
+        const refAll = AgnesAPIClient.refImageUrls(opts.image_urls);
+
+        /**
+         * 按字段名把参考图写进请求体: 数组型字段 (images/image_urls) 发多张, 单值型发第一张。
+         * 换字段前先清掉其它图字段 —— 同时出现两个图字段时平台多半直接 400。
+         */
+        const applyImageField = (field) => {
+            for (const f of IMAGE_FIELD_NAMES) delete body[f];
+            if (!refAll.length || !field) { appliedImageField = ''; return; }
+            const max = Math.min(this.maxRefImages(), 5);
+            const use = refAll.slice(0, max);
+            if (refAll.length > max) console.warn(`⚠️ 参考图 ${refAll.length} 张超过该平台常用上限 ${max} 张, 只提交前 ${max} 张`);
+            if (field === 'images' || field === 'image_urls') body[field] = use;
+            else body[field] = use[0];   // first_frame / image / image_url / input_reference: 单张
+            appliedImageField = field;
+            refUsed = use.length;
+        };
 
         if (this.platform === 'custom' && this.customJson.trim()) {
             // 自定义平台: 模板占位符替换，请求体完全由用户定义
             url = this.base + '/videos';
-            body = this.renderCustomTemplate(this.customJson, { prompt, duration, resolution, ratio });
+            body = this.renderCustomTemplate(this.customJson, {
+                prompt, duration, resolution, ratio,
+                // 自定义平台也能用参考图: 模板里写 {{image_url}} / {{image_urls_json}} / {{mode}}
+                mode: refAll.length ? (opts.refImageMode === 'keyframe' ? 'keyframe' : 'reference') : 'text',
+                imageUrl: refAll[0] || '',
+                imageUrls: refAll
+            });
+            // 模板里用到了图片占位符才算"这次带了参考图" (用于进度提示)
+            if (refAll.length && /\{\{image/.test(this.customJson)) refUsed = refAll.length;
         } else if (this.isArk()) {
-            // 火山方舟 (Seedance): 参数以 --key value 形式拼在提示词后
+            // 火山方舟 (Seedance): 参数以 --key value 形式拼在提示词后, 参考图放 content 里并带 role。
+            // 文档写法: content 可含 {type:'image_url', image_url:{url}, role:'first_frame'|'last_frame'};
+            // Seedance 2.0 系还支持 role:'reference_image' 作为"参考图"(而非首帧)。最多 9 张。
             url = this.base + '/contents/generations/tasks';
             let text = prompt;
             text += ` --resolution ${resolution} --ratio ${ratio} --duration ${duration} --watermark false`;
             if (this.seed !== null && this.seed !== undefined && this.seed !== '') {
                 text += ` --seed ${parseInt(this.seed) || 0}`;
             }
-            // 参考图支持: 将全部 first_frame 图片 URL 附加到文本内容前 (最多 9 张)
-            if (opts.image_urls && Array.isArray(opts.image_urls) && opts.image_urls.length > 0) {
-                const imageEntries = opts.image_urls.map(img => ({ type: 'image_url', image_url: { url: img.url } }));
-                body = {
-                    model: this.model,
-                    content: [...imageEntries, { type: 'text', text }]
-                };
-            } else {
-                body = { model: this.model, content: [{ type: 'text', text }] };
+            body = { model: this.model, content: [{ type: 'text', text }] };
+            const arkMode = opts.refImageMode || 'reference';
+            if (arkMode !== 'off' && refAll.length > 0) {
+                const maxArk = 9;
+                const use = refAll.slice(0, maxArk);
+                if (refAll.length > maxArk) console.warn(`⚠️ 参考图 ${refAll.length} 张超过方舟上限 ${maxArk} 张, 只提交前 ${maxArk} 张`);
+                // 只有 Seedance 2.0 系认 reference_image; 更早的版本只认首/尾帧, 这时按首帧发更稳
+                const supportsRefImage = /seedance[-_ ]?2|2[-_]0/i.test(this.model || '');
+                const entries = use.map((u, i) => ({
+                    type: 'image_url',
+                    image_url: { url: u },
+                    role: arkMode === 'keyframe'
+                        ? (i === 0 ? 'first_frame' : 'last_frame')
+                        : (supportsRefImage ? 'reference_image' : 'first_frame')
+                }));
+                body.content = [...entries, ...body.content];
+                refUsed = use.length;
             }
         } else {
             // OpenAI 兼容格式 (聚合站/Sora 风格): /videos
-            // mode 为 apihub 等 AGNES 系平台必填: v2.0 模型用图生视频模式, 其余用文生视频
-            // size 使用 "720P" 风格 (apihub 仅接受该格式); 若平台有别的约束, 由下方参数自适应自动修正
+            // 生成模式按 Agnes 官方文档 (Agnes Video 2.5 / 2.5 Flash, OpenAI Videos 兼容) 选择:
+            //   text      无媒体输入, 纯文生视频
+            //   keyframe  首帧/尾帧控制 -> first_frame / last_frame (与 images/audios/videos 互斥)
+            //   reference 图片/音频/视频参考 -> images / audios / videos (与 first_frame/last_frame 互斥)
+            // ★ 旧代码发的是 image_urls —— 平台没有这个字段, 会直接 400
+            //   (image_urls is not an allowed request field), 结果"带参考图的分镜"必挂。
+            //   这里改成官方字段, 并按"这一条分镜有没有参考图"自动切换文生/图生。
+            // size 使用 "720P" 风格 (apihub 仅接受该格式); Flash 只接受 "720P", 下面会强制收敛。
             // 时长档位吸附: Sora 风格平台仅接受 4/8/12 秒档位, 非法值 (如 10) 会被整单静默回退
             // 到平台默认 (实测 AGNES: 请求 10s -> 输出 5s 且比例丢失; 请求 12s -> 12.2s 且比例生效)
             sentDuration = this._snapOpenAIDuration(duration);
@@ -255,14 +309,54 @@ class AgnesAPIClient {
             body = {
                 model: this.model,
                 prompt: prompt,
-                mode: opts.mode || (/v2\.0/i.test(this.model) ? 'ti2vid' : 'text'),
+                mode: 'text',
                 seconds: String(sentDuration),
                 size: resolution === '1080p' ? '1080P' : (resolution === '480p' ? '480P' : '720P'),
                 aspect_ratio: ratio
             };
-            // 参考图支持 (first_frame 图生视频模式)
-            if (opts.image_urls && Array.isArray(opts.image_urls) && opts.image_urls.length > 0) {
-                body.image_urls = opts.image_urls;
+            const refs = refAll;
+            const refMode = opts.refImageMode || 'reference';   // reference | keyframe | off
+            imageIntent = refMode === 'keyframe' ? 'keyframe' : 'reference';
+            const isAgnes25 = /agnes.*2\.5|2\.5[-_]?flash/i.test(this.model || '');
+            if (/v2\.0/i.test(this.model)) {
+                // AGNES v2.0 系: 单图 -> image; 多图 -> extra_body.image (+ keyframes), 见官方文档示例 2~4
+                body.mode = 'ti2vid';
+                if (refMode !== 'off' && refs.length === 1) {
+                    body.image = refs[0];
+                } else if (refMode !== 'off' && refs.length > 1) {
+                    body.mode = 'keyframes';
+                    body.extra_body = { image: refs, mode: 'keyframes' };
+                }
+            } else if (refMode !== 'off' && refs.length > 0) {
+                if (isAgnes25) {
+                    // Agnes Video 2.5 / 2.5 Flash: 用官方文档字段 (images / first_frame), 张数上限 5/8
+                    const max = this.maxRefImages();
+                    const use = refs.slice(0, max);
+                    if (refs.length > max) {
+                        console.warn(`⚠️ 参考图 ${refs.length} 张超过该模型上限 ${max} 张, 只提交前 ${max} 张`);
+                    }
+                    if (refMode === 'keyframe') {
+                        body.mode = 'keyframe';    // 首帧图生视频: 画面从这张图开始
+                        body.first_frame = use[0];
+                    } else {
+                        body.mode = 'reference';   // 参考图生成: 人物/风格参考
+                        body.images = use;
+                    }
+                    refUsed = use.length;
+                } else {
+                    // 其他 OpenAI 兼容平台 (Sora 系 / 各类聚合站): 参考图字段名不统一,
+                    // 按候选顺序发第一个, 被平台 400 拒绝就换下一个并记住 (见 _imgRemember);
+                    // 这类平台的 mode 用法未知, 带图时不发 mode (不带图时仍按原来的 text 发)。
+                    delete body.mode;
+                    applyImageField(this.imageFieldCandidates(imageIntent)[0]);
+                }
+            }
+            if (opts.mode) body.mode = opts.mode;  // 显式指定优先 (特殊平台/测试)
+            // Flash 只接受 720P: 传别的值会被 400 拒掉 (文档: size must be 720P), 这里直接收敛
+            if (this.isFlashVideoModel() && body.size !== '720P') {
+                console.warn(`⚠️ ${this.model} 仅支持 720P, 已将 size ${body.size} 收敛为 720P`);
+                body.size = '720P';
+                sizeClamped = true;
             }
         }
 
@@ -295,9 +389,31 @@ class AgnesAPIClient {
                 if (e && e.cancelled) throw e;
                 // 平台参数自适应: 400 且错误信息指明字段合法取值时 (如 "size must be one of 720P"),
                 // 自动修正该字段并立即重试 (每个字段最多修正一次, 不消耗限流重试次数)
-                const m = e.status === 400
-                    ? /([a-zA-Z_]\w*)\s+must be one of\s+([^\s(,]+)/i.exec(e.message || '')
-                    : null;
+                // 两种写法都认: "size must be one of 720P,1080P" 与 "size must be 720P"。
+                // 后者只接受"数值/枚举型"取值 (720P / 1080P / 16:9 / 5) —— 否则
+                // "prompt must be a string" 这类类型说明会把字段值改成 "a", 越修越坏。
+                let m = null;
+                if (e.status === 400) {
+                    const msg = e.message || '';
+                    m = /([a-zA-Z_]\w*)\s+must be one of\s+([^\s(,]+)/i.exec(msg)
+                        || /([a-zA-Z_]\w*)\s+must be\s+['"]?(\d+(?:P|K)?|\d+:\d+)['"]?/i.exec(msg);
+                }
+                // 图生视频字段协商: 平台说"某字段不被允许"时拉黑该字段、换下一个候选立刻重试, 并记住结论 ——
+                // 各聚合站的参考图字段名五花八门, 试一次就该一劳永逸, 不该让用户去猜。
+                // 只协商图字段与 mode; size/seconds/aspect_ratio 这类核心参数走上面的"取值修正"。
+                const rejected = AgnesAPIClient.rejectedField(e);
+                if (rejected && AgnesAPIClient.negotiableField(rejected) && !this._imgRec().banned.includes(rejected)) {
+                    this._imgRemember({ banned: [...(this._imgRec().banned || []), rejected] });
+                    console.warn(`⚠️ 平台不接受字段 ${rejected} (${String(e.message).slice(0, 80)})，已记住并换其他方式重试`);
+                    if (IMAGE_FIELD_NAMES.includes(rejected) && refAll.length) {
+                        const next = this.imageFieldCandidates(imageIntent)[0];
+                        if (next) { applyImageField(next); attempt--; continue; }
+                        throw new Error('该平台不接受任何已知的参考图字段 (已试: '
+                            + [...this._imgRec().banned].join(', ') + ')。请在「模型设置 → 参考图调用方式」选择'
+                            + '"不使用参考图"(文生视频)，或改用支持参考图的模型');
+                    }
+                    if (rejected === 'mode') { delete body.mode; attempt--; continue; }
+                }
                 if (m && !fixedFields.has(m[1]) && m[1] in body && String(body[m[1]]) !== m[2] && fixedFields.size < 4) {
                     fixedFields.add(m[1]);
                     // 记忆修正结果, 同一客户端的后续提交直接带上
@@ -326,6 +442,9 @@ class AgnesAPIClient {
             }
         }
 
+        // 这次带图提交被平台接受了: 记住用的字段, 之后的任务不再试错
+        if (appliedImageField) this.rememberImageField(appliedImageField);
+
         const taskId = this.extractTaskId(data);
         if (!taskId) {
             console.error('❌ 提交响应中未找到任务 ID:', data);
@@ -334,14 +453,110 @@ class AgnesAPIClient {
 
         const result = {
             taskId,
+            // AGNES 创建任务会同时返回 task_id 与 video_id; video_id 是官方推荐的查询用 ID
+            // (非 text 模式尤其推荐带上 model_name), task_id 走旧的 /videos/{id} 兜底
+            videoId: this.extractVideoId(data),
             status: this.mapStatus(this.deepGet(data, ['status', 'task_status', 'state'])) || 'queued',
             videoUrl: this.extractVideoUrl(data),
+            mode: (body && body.mode) || '',
+            refImageCount: refUsed,
+            sizeSent: (body && body.size) || '',
+            sizeClamped,
             durationSent: sentDuration,
             durationRequested: duration,
             raw: data
         };
-        console.log(`✅ 任务已提交: ${taskId} (初始状态: ${result.status})`);
+        console.log(`✅ 任务已提交: ${taskId}${result.videoId ? ` (video_id: ${result.videoId})` : ''}`
+            + ` (初始状态: ${result.status}${result.mode ? `, mode: ${result.mode}` : ''}${refUsed ? `, 参考图 ${refUsed} 张` : ''})`);
         return result;
+    }
+
+    /** 参考图归一化: 接受 [{url,role}] / ['url'] / 'url', 去空去重 (方舟与 OpenAI 兼容两条链路共用) */
+    static refImageUrls(list) {
+        if (!list) return [];
+        const arr = Array.isArray(list) ? list : [list];
+        const out = [];
+        for (const it of arr) {
+            const u = typeof it === 'string' ? it : ((it && (it.url || it.image_url || it.image)) || '');
+            if (u && !out.includes(u)) out.push(String(u));
+        }
+        return out;
+    }
+
+    /** 本端点的"图生视频字段记忆" (内存 + localStorage): { imageField, banned: [] } */
+    _imgRec() {
+        if (this._imgRecCache) return this._imgRecCache;
+        let all = {};
+        try {
+            if (typeof localStorage !== 'undefined') all = JSON.parse(localStorage.getItem(IMAGE_FIELD_STORE_KEY) || '{}') || {};
+        } catch (_) { all = {}; }
+        this._imgRecKey = `${this.platform}|${this.base || ''}|${this.model}`;
+        this._imgRecAll = all;
+        this._imgRecCache = all[this._imgRecKey] || { imageField: '', banned: [] };
+        return this._imgRecCache;
+    }
+
+    /** 记住本端点的图生视频结论: 哪个字段可用、哪些字段被平台拒过 (落 localStorage, 刷新后仍有效) */
+    _imgRemember(patch) {
+        const rec = Object.assign(this._imgRec(), patch);
+        rec.banned = [...new Set(rec.banned || [])];
+        this._imgRecCache = rec;
+        try {
+            if (typeof localStorage !== 'undefined') {
+                this._imgRecAll[this._imgRecKey] = rec;
+                localStorage.setItem(IMAGE_FIELD_STORE_KEY, JSON.stringify(this._imgRecAll));
+            }
+        } catch (_) { /* 隐私模式/配额满: 只在本次会话内生效 */ }
+        return rec;
+    }
+
+    /** 记录"这个字段验证可用" (协商成功后调用), 下次直接用 */
+    rememberImageField(field) {
+        if (field) this._imgRemember({ imageField: field });
+        return field;
+    }
+
+    /** 参考图字段候选顺序: 学到的优先; 被拉黑的排除; 首帧意图把 first_frame 提前 */
+    imageFieldCandidates(intent = 'reference') {
+        const rec = this._imgRec();
+        const base = intent === 'keyframe'
+            ? ['first_frame', 'image_url', 'image', 'image_urls', 'images', 'input_reference']
+            : ['image_urls', 'images', 'image_url', 'input_reference', 'image', 'first_frame'];
+        const list = (rec.imageField ? [rec.imageField, ...base] : base).filter(f => !rec.banned.includes(f));
+        return [...new Set(list)];
+    }
+
+    /** 从 400 错误里解析"哪个字段不被允许" (各平台措辞不同, 多认几种写法) */
+    static rejectedField(e) {
+        const msg = String((e && e.message) || '');
+        const m = /([a-zA-Z_]\w*)\s+is not an allowed request field/i.exec(msg)
+            || /(?:unknown|unexpected|unsupported|invalid|not allowed|unrecognized)[ _-]*(?:request[ _-])?(?:field|parameter|kye|key)s?\s*[:=]?\s*['"]?([a-zA-Z_]\w*)/i.exec(msg)
+            || /(?:field|parameter|key)\s*['"]?([a-zA-Z_]\w*)['"]?\s+is (?:not allowed|unknown|unsupported|invalid|unexpected)/i.exec(msg);
+        return m ? m[1] : '';
+    }
+
+    /** 该字段能不能"协商"掉: 只动参考图相关字段与 mode, 核心参数不碰 */
+    static negotiableField(f) {
+        return f === 'mode' || IMAGE_FIELD_NAMES.includes(f);
+    }
+
+    /** 参考图张数上限: 2.5 Flash 5 张, 其余(2.5 等) 8 张 —— 见官方文档"参考媒体限制" */
+    maxRefImages() {
+        return this.isFlashVideoModel() ? 5 : 8;
+    }
+
+    /** 是否 Agnes Video 2.5 Flash 系 (只接受 size="720P", 参考图最多 5 张) */
+    isFlashVideoModel() {
+        return /2\.5[-_]?flash/i.test(this.model || '');
+    }
+
+    /** 创建任务响应里的 video_id (官方推荐用它查询任务结果) */
+    extractVideoId(data) {
+        if (!data) return null;
+        return this.deepGet(data, [
+            'video_id', 'videoId',
+            'data.video_id', 'result.video_id', 'video.id', 'output.video_id'
+        ]) || null;
     }
 
     static isRateLimitError(err) {
@@ -495,6 +710,11 @@ class AgnesAPIClient {
         subst('resolution', vars.resolution);
         subst('ratio', vars.ratio);
         subst('seed', this.seed ?? 0);
+        subst('mode', vars.mode || 'text');
+        // 参考图: {{image_url}} 是单张 URL (文生视频时为空串); {{image_urls_json}} 裸替换成 JSON 数组,
+        // 便于模板里直接写 "images": {{image_urls_json}} —— 这样任何平台的图生视频字段都能自己接
+        subst('image_url', vars.imageUrl || '');
+        s = s.split('{{image_urls_json}}').join(JSON.stringify(vars.imageUrls || []));
 
         let parsed;
         try { parsed = JSON.parse(s); } catch (e) {
@@ -505,12 +725,13 @@ class AgnesAPIClient {
 
     /* ================= 查询任务状态 (核心修复) ================= */
 
-    async queryTask(taskId) {
-        const paths = this.queryPaths(taskId);
+    async queryTask(taskId, opts = {}) {
+        const paths = this.queryPaths(taskId, opts);
         let lastErr = null;
 
         for (const p of paths) {
-            const url = this.base + p;
+            // queryPaths 给的多半是相对路径 (拼 this.base); AGNES 的 /agnesapi 挂在站点根上, 直接给绝对地址
+            const url = /^https?:\/\//i.test(p) ? p : this.base + p;
             try {
                 const data = await this.request(url);
                 const norm = this.normalizeQuery(data);
@@ -533,7 +754,7 @@ class AgnesAPIClient {
         throw err;
     }
 
-    queryPaths(taskId) {
+    queryPaths(taskId, opts = {}) {
         if (this.platform === 'custom' && this.customPollPath.trim()) {
             let p = this.customPollPath.trim();
             if (!p.startsWith('/')) p = '/' + p;
@@ -544,10 +765,30 @@ class AgnesAPIClient {
             return [`/contents/generations/tasks/${encodeURIComponent(taskId)}`];
         }
         // OpenAI 兼容平台主路径 + 常见变体
-        return [
+        const legacy = [
             `/videos/${encodeURIComponent(taskId)}`,
             `/contents/generations/tasks/${encodeURIComponent(taskId)}` // 兼容方舟式聚合站
         ];
+        // AGNES 官方推荐: /agnesapi?video_id=..&model_name=.. —— 文档写明"仅 video_id"的形式
+        // 只适用于 text 模式, 参考图/首帧这类任务要走带 model_name 的推荐形式。
+        // 所以: 非 text 模式把它排在第一位 (旧的 task_id 路径仍作为兜底), text 模式维持原顺序。
+        const byVideo = this._agnesQueryUrl(opts.videoId, opts.model);
+        if (!byVideo) return legacy;
+        return opts.preferVideoId ? [byVideo, ...legacy] : [...legacy, byVideo];
+    }
+
+    /** 站点根地址 (去掉 /v1 之类的版本段): /agnesapi 这类接口挂在站点根上, 不在 /v1 下 */
+    _rootBase() {
+        return String(this.base || '').replace(/\/v\d+\/?$/i, '');
+    }
+
+    /** AGNES 推荐查询地址: /agnesapi?video_id=..( &model_name=..) —— 仅在拿得到 video_id 时给出 */
+    _agnesQueryUrl(videoId, model) {
+        if (!videoId) return '';
+        const q = [`video_id=${encodeURIComponent(videoId)}`];
+        const m = model || this.model;
+        if (m) q.push(`model_name=${encodeURIComponent(m)}`);
+        return `${this._rootBase()}/agnesapi?${q.join('&')}`;
     }
 
     /**
