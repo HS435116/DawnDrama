@@ -23,7 +23,7 @@ const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 const { reclaimStaleInstance, waitPortFree, listeningPids, commandLine, isOurServer } = require('./port-utils');
 
-const APP_VERSION = '2.8.4';
+const APP_VERSION = '2.8.5';
 
 const app = express();
 const PORT = parseInt(process.env.PORT) || 3000;

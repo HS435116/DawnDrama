@@ -16,7 +16,7 @@
  */
 
 // ================= 版本信息 =================
-const APP_VERSION = '2.8.4';
+const APP_VERSION = '2.8.5';
 // 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date"})
 // 发布新版本时的检查清单:
 //   1) bump 本文件的 APP_VERSION、package.json 的 version、server.js 的 APP_VERSION
@@ -5264,22 +5264,85 @@ ${previous}${lastCliff}
         }
     }
 
+    /**
+     * 结束"本次运行"的全部任务 —— "停止挂机"与"清除剧本任务"共用。
+     * 为什么需要它: 只把 _autoRunning 置 false 只挡得住"下一集";
+     * 已经提交、正在轮询或正在下载的任务会一直跑到自己结束。
+     * 更麻烦的是"上次卡住了"这类只剩落盘痕迹、循环早就退出的状态 ——
+     * 没有循环就没人收尾, 于是用户点了"停止挂机"却发现提醒下次还会再来、任务也还在动。
+     * 这里一次做完:
+     *  1. 停掉挂机循环与"继续"入口;
+     *  2. 中断在途请求 (提交/轮询/下载), 并把正在跑的任务就地标记为已停止;
+     *  3. 把还挂在"排队中/生成中"的记录一并收尾 (平台已提交的记"未知", 可"任务扫描"找回; 未提交的记"失败", 可"重试");
+     *  4. 清掉落盘痕迹, 下次打开不会再问"上次的挂机任务要不要继续"。
+     * 任务记录与已保存的视频/片段都不删, 只是不再执行。
+     * @returns {{aborted:number, marked:number}} 中断的在途请求数、收尾的未完成任务数
+     */
+    _endRunTasksNow() {
+        this._autoRunning = false;
+        this._autoPaused = false;
+        this.stopRequested = true;
+        const aborted = this.apiClient && this.apiClient.abortInFlight ? this.apiClient.abortInFlight() : 0;
+        this._markRunningItemsStopped();
+        const marked = this._settlePendingRecords();
+        this.clearRunState();            // 用户明确结束: 不保留本次运行记录
+        this.showAutoRunControls(false);
+        this._unfinishedSig = null;
+        this.renderUnfinishedTasks(true);
+        return { aborted, marked };
+    }
+
+    /** 把还挂在"排队中/生成中"的记录就地收尾: 记录保留, 可重试、也可"任务扫描"找回 */
+    _settlePendingRecords() {
+        let n = 0;
+        this.history.forEach(rec => {
+            if (!rec || rec.duplicateOf) return;   // 共享平台任务的副本由主记录代表
+            if (!this.isPendingStatus(this.normalizeLegacyStatus(rec.status))) return;
+            this._markRecordStopped(rec, this.recordProgressLabel(rec));   // 内部会落盘并刷新作品库
+            n++;
+        });
+        if (n) { this.saveHistory(); this.renderGallery(); this.renderHistory(); }
+        return n;
+    }
+
+    /**
+     * 停止挂机 = 结束本次运行的全部任务 (不只是不再开下一集):
+     * 在途请求立刻中断、排队/生成中的任务就地收尾、落盘痕迹清掉不再提示续跑。
+     * 平台上已生成完成的视频不会被取消, 之后用"🔍 任务扫描并找回"照样能取回。
+     */
     async stopAutoRun() {
-        if (!this._autoRunning) return;
+        const state = this.loadRunState();
+        const unfinished = this.getUnfinishedTasks();
+        const busy = this._autoRunning || this.isGenerating || (this._activeJobs && this._activeJobs.size > 0);
+        const pendingCount = unfinished.pending.length;
+        const hasTrace = !!(state && state.active);
+        // 真的没有任何东西可停 (没在跑、没痕迹、也没有未完成任务) 才空手而归
+        if (!busy && !hasTrace && unfinished.all.length === 0) {
+            return this.setSeriesStatus('当前没有正在执行的剧本任务', 'success');
+        }
+
+        const lines = [];
+        if (busy) lines.push('· 正在执行的任务会立即停止（在途的提交/轮询/下载请求会被中断）');
+        if (pendingCount) lines.push(`· ${pendingCount} 个"排队中/生成中"的任务一并收尾（记录保留，可重试或"任务扫描"找回）`);
+        if (hasTrace) lines.push('· 本次挂机的进度记录会清掉（下次打开不再提示"继续上次任务"）');
+
         const ok = await this.showConfirm({
-            title: '⏹️ 停止全剧自动生成',
+            title: '⏹️ 停止挂机并结束本次任务',
             message: '这是唯一会中断挂机的操作（刷新、断网、关页面都不会）。\n\n'
-                + '当前正在生成的任务也会停止，已完成的集数与片段全部保留；\n'
-                + '停止后不会再自动续跑，下次需要你重新点"🚀💤 一键生成本剧全部视频"。',
-            okText: '⏹️ 确定停止',
+                + (lines.length ? `将结束本次运行的全部任务：\n${lines.join('\n')}\n\n` : '')
+                + '已生成完成的视频与已保存的片段全部保留，本地文件不会被删除；\n'
+                + '平台上已生成完成的任务也不会被取消，停止后可随时点"🔍 任务扫描并找回"把它们取回来。',
+            okText: '⏹️ 结束全部任务',
             danger: true
         });
         if (!ok) return;
-        this._autoRunning = false;
-        this._autoPaused = false;
-        this.stopRequested = true; // 中断当前集的任务监控
-        this.clearRunState();       // 用户明确停止: 痕迹清掉, 下次打开不再自动续跑
-        this.setSeriesStatus('⏹️ 正在停止全剧生成...(已完成的集数与片段保留)', 'warning');
+
+        const { aborted, marked } = this._endRunTasksNow();
+        const what = [];
+        if (aborted) what.push(`中断了 ${aborted} 个在途请求`);
+        if (marked) what.push(`收尾了 ${marked} 个未完成任务`);
+        this.setSeriesStatus(`⏹️ 已结束本次挂机的全部任务${what.length ? '：' + what.join('、') : ''}。\n`
+            + '已完成的片段与成片都保留；平台上已提交的任务记录也留着，可点"🔍 任务扫描并找回"取回。', 'warning');
     }
 
     /** 应用内输入对话框 (存档命名等): 返回 Promise<string|null> */
@@ -5467,17 +5530,24 @@ ${previous}${lastCliff}
 
     /**
      * 清除短剧工坊数据 (右上角按钮):
-     * 清空剧集设定/人物卡/分镜/集数历史, 用于开始一部新剧; 不影响已生成的视频作品。
+     * 清空剧集设定/人物卡/分镜/集数历史, 用于开始一部新剧; 不影响已生成完成的视频作品。
+     * 任务还在跑时不再直接拒绝, 而是弹对话框让用户选择"停止全部剧本任务并清除"或取消 ——
+     * 先停后清的顺序不能反: 否则任务会继续执行、而记录已被清掉,
+     * 既找不到任务又会往磁盘写已废弃剧集的片段 (污染文件)。
+     * 清除后不保留本次运行记录 (下次打开不会再提示"继续上次任务")。
      */
     async clearSeries() {
         const s = this.series;
         const hasData = s.title || s.premise || s.characters.length || s.currentScenes.length || s.episodes.length;
         if (!hasData) return this.showStatus('短剧工坊已是空状态，无需清除', 'success');
 
-        // 任务还在跑的时候不允许清除: 否则任务会继续执行、而记录已被清掉,
-        // 既找不到任务又会往磁盘写已废弃剧集的片段 (污染文件)。
-        if (this._autoRunning) return this.setSeriesStatus('⚠️ 全剧自动生成正在运行，请先点"⏹️ 停止全剧生成"再清除剧本任务', 'error');
-        if (this.isGenerating) return this.setSeriesStatus('⚠️ 还有生成任务正在进行，请先点"⏹️ 停止"再清除剧本任务', 'error');
+        // 还在执行的活儿有多少 —— 写进对话框, 让用户知道点"确定"会停掉什么。
+        // 注意区分两种情况: 真的在跑 (busy) vs 只剩上次的进度痕迹 (hasTrace, 例如关页面留下的)。
+        // 后者没有任务要停, 只是要把记录一并清掉, 否则下次打开还会问"要继续上次任务吗"。
+        const state = this.loadRunState();
+        const busy = this._autoRunning || this.isGenerating || (this._activeJobs && this._activeJobs.size > 0);
+        const hasTrace = !!(state && state.active);
+        const unfinished = this.getUnfinishedTasks();
 
         // 该剧占用的作品库记录 —— 必须在重置 this.series 之前算好
         const titles = this.seriesRecordTitles(s);
@@ -5485,8 +5555,15 @@ ${previous}${lastCliff}
         const leftover = owned.filter(h => this._isUnfinishedRecord(h));
         const keepCount = owned.length - leftover.length;
 
+        const runningNote = busy
+            ? `\n⏹️ 本次挂机/生成还没结束${unfinished.pending.length ? `（还有 ${unfinished.pending.length} 个任务在执行）` : ''}：\n`
+                + `点"⏹️ 停止任务并清除"会先把本次全部剧本任务停掉（中断在途请求、收尾未完成任务）再清除。\n`
+            : (hasTrace
+                ? '\nℹ️ 上次的挂机记录还留着（下次打开会提示"继续上次任务"），本次会一并清掉。\n'
+                : '');
+
         const ok = await this.showConfirm({
-            title: '🗑️ 清除短剧工坊数据',
+            title: '🗑️ 清除剧本任务',
             message: `将删除剧集《${s.title || '未命名'}》：\n`
                 + `· 剧集设定与主提示词\n`
                 + `· ${s.characters.length} 个人物设定卡\n`
@@ -5494,12 +5571,17 @@ ${previous}${lastCliff}
                 + `· ${s.episodes.length} 集剧本历史 (当前进度: 第${s.nextEpisode}集)\n`
                 + `\n并同步清理该剧在作品库中未完成的 ${leftover.length} 个任务记录——\n`
                 + `否则"任务扫描"会一直留存它们，一旦重试就会继续消耗平台配额并生成已废弃的片段。\n`
+                + runningNote
+                + `\n清除后不保留本次运行的任何记录（下次打开不会再提示"继续上次任务"）。\n`
                 + `\n已生成完成的 ${keepCount} 个作品记录会保留；本地视频文件不会被删除。\n`
                 + `\n💡 如需保留人物设定用于续季 (第二季人物一致性)，请先点"💾 保存当前剧本存档"再清除。`,
-            okText: '🗑️ 确定清除',
+            okText: busy ? '⏹️ 停止任务并清除' : '🗑️ 确定清除',
             danger: true
         });
         if (!ok) return;
+
+        // 用户已确认: 先结束本次运行的全部任务, 再清剧本数据 (顺序反了会污染磁盘、丢任务)
+        const { aborted, marked } = this._endRunTasksNow();
 
         this.series = this.getDefaultSeries();
         this.saveSeries();
@@ -5519,9 +5601,13 @@ ${previous}${lastCliff}
         this.renderSeriesUI();
         this._unfinishedSig = null;
         this.renderUnfinishedTasks(true); // 立即从"未完成任务"面板移除, 不留残余
-        this.setSeriesStatus(removedTasks
-            ? `🗑️ 剧本数据已清空，并同步清理了 ${removedTasks} 个未完成任务记录。可以开始一部新剧了`
-            : '🗑️ 剧本数据已清空，可以开始一部新剧了', 'success');
+        const stopped = [];
+        if (aborted) stopped.push(`中断 ${aborted} 个在途请求`);
+        if (marked) stopped.push(`收尾 ${marked} 个未完成任务`);
+        this.setSeriesStatus('🗑️ 剧本数据已清空'
+            + (removedTasks ? `，并同步清理了 ${removedTasks} 个未完成任务记录` : '')
+            + (stopped.length ? `（本次全部任务已停止：${stopped.join('、')}）` : '')
+            + '。本次记录不保留，可以开始一部新剧了', 'success');
     }
 
     renderSeriesUI() {
