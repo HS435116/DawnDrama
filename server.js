@@ -22,8 +22,9 @@ const fs = require('fs');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 const { reclaimStaleInstance, waitPortFree, listeningPids, commandLine, isOurServer } = require('./port-utils');
+const { getPosterFile } = require('./video-poster');
 
-const APP_VERSION = '2.8.6';
+const APP_VERSION = '2.8.7';
 
 const app = express();
 const PORT = parseInt(process.env.PORT) || 3000;
@@ -229,7 +230,10 @@ const DATA_DIR_FILE = path.join(process.cwd(), 'agnes-data-dir.json');
 
 const IMAGES_FOLDER = 'images';
 const VIDEO_FOLDER = 'video';
-const MANAGED_FOLDERS = [IMAGES_FOLDER, VIDEO_FOLDER];
+// 作品库封面缓存 (视频第一帧), 由 /api/poster 生成; 属于程序自己管理的目录,
+// 与 images/video 一样不能让用户当保存根, 也不参与作品库扫描
+const POSTER_CACHE_FOLDER = '.posters';
+const MANAGED_FOLDERS = [IMAGES_FOLDER, VIDEO_FOLDER, POSTER_CACHE_FOLDER];
 
 /** 规范化用户填写的保存根目录; 非法时返回 '' */
 function normalizeOutputDir(raw) {
@@ -981,6 +985,27 @@ app.delete('/api/file/:type/:title/:filename', (req, res) => {
     const filePath = resolveLibraryPath(rel);
     if (filePath) { fs.unlinkSync(filePath); res.json({ success: true }); }
     else res.status(404).json({ error: '文件不存在: ' + rel });
+});
+
+// ================= 作品库封面 (视频第一帧当海报) =================
+// 按库内相对路径取封面: 视频用 ffmpeg 抽第一帧并缓存到 <作品库>/.posters,
+// 图片作品直接回原图。抽帧失败/文件缺失一律 404, 前端回退成默认图标。
+app.get('/api/poster', async (req, res) => {
+    const rel = String(req.query.path || '').trim();
+    if (!rel) return res.status(400).json({ error: '缺少 path 参数' });
+    const filePath = resolveLibraryPath(rel);
+    if (!filePath || !filePath.startsWith(CONFIG.basePath)) {
+        return res.status(404).json({ error: '文件不存在: ' + rel });
+    }
+    let poster = null;
+    try {
+        poster = await getPosterFile(filePath, { cacheDir: path.join(CONFIG.basePath, POSTER_CACHE_FOLDER) });
+    } catch (e) {
+        console.error(`❌ [poster] 生成封面失败 (${rel}): ${e.message}`);
+    }
+    if (!poster) return res.status(404).json({ error: '无法生成封面: ' + rel });
+    // no-cache: 浏览器仍带 ETag 回来校验 —— 成片重新烧录后封面会立刻换新, 不会一直显示旧帧
+    res.sendFile(poster, { headers: { 'Cache-Control': 'no-cache' } });
 });
 
 // ================= 合并剧集目录 (服务器模式自动/手动合并: 调用 merge_videos.py) =================

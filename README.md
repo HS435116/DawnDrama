@@ -96,6 +96,13 @@ npm run desktop:build
 
 输出 `<剧名>_完整版.mp4`（**原始分镜片段全部保留不删除**）
 
+🖼️ 作品库
+
+- **视频封面**：生成完成的视频自动取第一帧画面当海报展示；图片作品直接显示原图
+- **开头黑场规避**：片段开头是黑场（AI 片段常见的淡入）时，自动往后取第一张有画面的帧，封面不会是一块黑
+- **按需生成 + 缓存**：首次浏览时用内置 ffmpeg 抽帧，结果缓存在作品库的 `.posters` 目录，同一文件只抽一次；成片重新合并后封面自动换新
+- **失败回退**：取不到画面（文件缺失/非媒体文件）时回退成原来的 🎬/🖼️ 图标，不会出现破图
+
 💾 剧本存档
 
 支持跨季续写：
@@ -125,8 +132,8 @@ npm install
 3. 打包
 npm run desktop:build
 产物在 desktop-dist/：
-   晨曦短剧梦工坊-v2.8.6-便携版.exe
-   晨曦短剧梦工坊-安装版-v2.8.6.exe
+   晨曦短剧梦工坊-v2.8.7-便携版.exe
+   晨曦短剧梦工坊-安装版-v2.8.7.exe
 ```
 
 **便携模式资源路径：**
@@ -158,11 +165,12 @@ npm run desktop:build
 ├── api-client.js            多平台 API 适配器（含模型时长识别）
 ├── server.js                Node 服务器（代理/落盘/作品库/合并接口）
 ├── merge_videos.py          视频合并 + VAD+ASR 字幕烧录核心脚本
+├── video-poster.js          作品库封面（视频第一帧抽帧 + 缓存）
 ├── electron-process-video.js Electron IPC 处理器（便携模式资源定位）
 ├── electron-main.js         Electron 桌面版主进程
 ├── electron-preload.js      Electron 预加载桥
 ├── styles.css               样式
-├── package.json             项目配置（v2.8.6）
+├── package.json             项目配置（v2.8.7）
 ├── latest.json              版本更新清单
 ├── assets/                  图标资源
 ├── output/                  生成结果（不推送, gitignore）

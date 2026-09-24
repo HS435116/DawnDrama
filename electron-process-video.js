@@ -7,9 +7,65 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
-// 脚本路径
-const MERGE_SCRIPT = path.join(__dirname, 'merge_videos.py');
+// ============================================================
+// 合并脚本定位 (打包后必须指向 asar 之外的真实文件)
+// ============================================================
+// asar 只是 Electron 给 fs/require 打的补丁, python.exe 是**外部进程**:
+// 把 app.asar 当普通目录打开必然 "No such file or directory"。因此脚本要
+// 用 electron-builder 的 asarUnpack 解包, 这里负责找到解包后的那份。
+const MERGE_SCRIPT_IN_ASAR = path.join(__dirname, 'merge_videos.py');
+let _mergeScriptPath = null;
+
+/**
+ * 路径是否位于 asar **归档内部**。
+ * 注意不能用 includes('app.asar'): 解包目录 app.asar.unpacked 也含这个子串,
+ * 必须限定成 "app.asar + 路径分隔符"。
+ */
+function isInsideAsar(p) {
+    return /app\.asar[\\/]/.test(String(p || ''));
+}
+
+function resolveMergeScriptPath() {
+    // fs.existsSync 对 asar 内的虚拟路径同样返回 true, 所以只认解包后的真实文件
+    const unpacked = MERGE_SCRIPT_IN_ASAR.replace(/([\\/])app\.asar([\\/])/, '$1app.asar.unpacked$2');
+    if (unpacked !== MERGE_SCRIPT_IN_ASAR && fs.existsSync(unpacked)) return unpacked;
+    // 开发模式: 项目目录里就是真实文件
+    if (!isInsideAsar(MERGE_SCRIPT_IN_ASAR) && fs.existsSync(MERGE_SCRIPT_IN_ASAR)) {
+        return MERGE_SCRIPT_IN_ASAR;
+    }
+    // 兜底: 打包配置漏了 asarUnpack 时, 把脚本读出来落到临时目录再执行
+    try {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agnes-merge-'));
+        const dest = path.join(dir, path.basename(MERGE_SCRIPT_IN_ASAR));
+        fs.writeFileSync(dest, fs.readFileSync(MERGE_SCRIPT_IN_ASAR));
+        console.log(`[VideoProcess] 合并脚本未解包, 已释放到临时目录: ${dest}`);
+        return dest;
+    } catch (e) {
+        console.error(`[VideoProcess] 释放合并脚本失败: ${e.message}`);
+        return MERGE_SCRIPT_IN_ASAR;
+    }
+}
+
+function getMergeScriptPath() {
+    if (!_mergeScriptPath) _mergeScriptPath = resolveMergeScriptPath();
+    return _mergeScriptPath;
+}
+
+/**
+ * 子进程的工作目录必须是真实存在的目录。
+ * 打包后脚本在 app.asar 内时, path.dirname() 拿到的是个**文件**(app.asar),
+ * Windows 的 CreateProcess 遇到这种工作目录会直接失败, Node 只报
+ * "spawn <python.exe> ENOENT" —— 看着像 python 缺失, 其实 python 好好的。
+ */
+function resolveSafeCwd(dir) {
+    try {
+        if (dir && fs.statSync(dir).isDirectory()) return dir;
+    } catch (_) { /* 不存在或不可访问 */ }
+    console.warn(`[VideoProcess] 工作目录不可用 (${dir}), 改用系统临时目录`);
+    return os.tmpdir();
+}
 
 // merge_videos.py 的阶段进度标记前缀 (形如: @@AGNES_STAGE@@ {"stage":"asr",...})
 const STAGE_PREFIX = '@@AGNES_STAGE@@';
@@ -186,6 +242,15 @@ function mergeEpisodesBatch(episodePaths, progressCallback, completeCallback) {
 }
 
 function runMergeScript(scriptArgs, callback, onStage) {
+    // 脚本必须落在 asar 之外, 否则外部进程的 python 读不到它
+    const scriptPath = getMergeScriptPath();
+    if (!scriptPath || isInsideAsar(scriptPath) || !fs.existsSync(scriptPath)) {
+        return callback(new Error(
+            `合并脚本不可用: ${scriptPath || '(未找到)'}\n`
+            + '打包版需要把 merge_videos.py 解包到 asar 之外 (package.json → build.asarUnpack)，'
+            + '请重新构建安装包或重新获取完整版本。'));
+    }
+
     // 确定 Python 解释器
     const embeddedPython = getEmbeddedPython();
     let pythonExe;
@@ -215,8 +280,8 @@ function runMergeScript(scriptArgs, callback, onStage) {
         ...(asrModelDir ? { AGNES_ASR_MODEL: asrModelDir } : {}),
     });
 
-    const python = spawn(pythonExe, [MERGE_SCRIPT, ...scriptArgs], {
-        cwd: path.dirname(MERGE_SCRIPT),
+    const python = spawn(pythonExe, [scriptPath, ...scriptArgs], {
+        cwd: resolveSafeCwd(path.dirname(scriptPath)),
         windowsHide: true,
         env: env
     });
@@ -302,5 +367,7 @@ function runMergeScript(scriptArgs, callback, onStage) {
 module.exports = {
     mergeEpisode,
     mergeVideoFiles,
-    mergeEpisodesBatch
+    mergeEpisodesBatch,
+    // 打包路径解析的纯函数 (测试用, 不参与运行时逻辑)
+    __paths: { isInsideAsar, resolveMergeScriptPath, resolveSafeCwd }
 };

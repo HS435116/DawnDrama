@@ -1,6 +1,6 @@
 {
   "name": "agnes-2.5-video-generator",
-  "version": "2.8.6",
+  "version": "2.8.7",
   "description": "晨曦短剧梦工坊 - 多平台AI短剧批量制作工具",
   "main": "electron-main.js",
   "scripts": {
@@ -85,6 +85,7 @@
       "electron-main.js",
       "electron-preload.js",
       "electron-process-video.js",
+      "video-poster.js",
       "server.js",
       "port-utils.js",
       "free-port.js",
@@ -96,6 +97,9 @@
       "assets/**",
       "latest.json",
       "package.json"
+    ],
+    "asarUnpack": [
+      "merge_videos.py"
     ],
     "extraResources": [
       {

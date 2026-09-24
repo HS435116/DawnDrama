@@ -16,7 +16,7 @@
  */
 
 // ================= 版本信息 =================
-const APP_VERSION = '2.8.6';
+const APP_VERSION = '2.8.7';
 // 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date"})
 // 发布新版本时的检查清单:
 //   1) bump 本文件的 APP_VERSION、package.json 的 version、server.js 的 APP_VERSION
@@ -2625,6 +2625,14 @@ class AgnesVideoGenerator {
         const errorHtml = (isFailed || isUnknown) && item.error
             ? `<div class="card-error" title="${this.escapeAttr(item.error)}">⚠️ ${this.escapeHtml(item.error).slice(0, 80)}</div>` : '';
 
+        // 封面: 只有"已完成且本地有文件"的记录才有 (在线的平台地址抽不了帧)。
+        // 视频取第一帧、图片回原图, 都由本地服务器的 /api/poster 生成并缓存;
+        // 取不到图时 onerror 把 <img> 摘掉, 露出后面的默认图标, 不会留破图
+        const posterUrl = isDone ? this.posterUrl(item) : '';
+        const posterHtml = posterUrl
+            ? `<img class="card-poster" src="${this.escapeAttr(posterUrl)}" alt="" loading="lazy" decoding="async" onerror="this.remove()">`
+            : '';
+
         return `
         <div class="media-card" data-type="${item.type}" data-title="${this.escapeAttr(item.title)}" data-id="${item.id}" data-status="${status}">
             <div class="card-checkbox">
@@ -2632,6 +2640,7 @@ class AgnesVideoGenerator {
             </div>
             <div class="thumbnail card-thumb-${item.type === 'video' ? 'video' : 'image'}">
                 ${item.type === 'video' ? '🎬' : '🖼️'}
+                ${posterHtml}
                 <div class="status-badge" style="color: ${badgeColor};">${badge}</div>
             </div>
             <div class="info">
@@ -2668,6 +2677,16 @@ class AgnesVideoGenerator {
         this.galleryFilter = filter;
         document.querySelectorAll('.filter-chips .chip').forEach(ch => ch.classList.toggle('active', ch.dataset.filter === filter));
         this.renderGallery();
+    }
+
+    /**
+     * 卡片封面地址 (服务端按库内相对路径抽帧/回原图, 结果落盘缓存)。
+     * 只认 item.path: 那是保存到本地的库内路径; 平台在线地址抽不了帧, 交给默认图标。
+     */
+    posterUrl(item) {
+        const rel = String((item && item.path) || '').trim();
+        if (!rel) return '';
+        return '/api/poster?path=' + encodeURIComponent(rel);
     }
 
     setView(view) {
