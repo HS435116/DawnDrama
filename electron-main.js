@@ -12,10 +12,18 @@
 const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const net = require('net');
+const { spawn } = require('child_process');
 const { mergeEpisode, mergeVideoFiles, mergeEpisodesBatch } = require('./electron-process-video');
+const { downloadToFile, fetchJson, fileNameFromUrl, looksLikeInstaller } = require('./update-downloader');
 
 let win = null;
+
+/** 便携版: 单文件 exe, 就地升级要替换正在运行的文件 (Windows 不允许), 所以只下载不自动安装 */
+const IS_PORTABLE = !!process.env.PORTABLE_EXECUTABLE_DIR;
+/** 本次是不是"安装完刚起来" (NSIS 装完启动会带 --updated), 前端据此提示一句 */
+const IS_UPDATED_RUN = process.argv.includes('--updated');
 
 // 单实例锁: 二次启动时聚焦已有窗口
 if (!app.requestSingleInstanceLock()) {
@@ -85,6 +93,143 @@ ipcMain.on('win-reveal-absolute', (_, absPath) => {
     if (typeof absPath !== 'string' || !path.isAbsolute(absPath)) return;
     try { if (!fs.existsSync(absPath)) return; } catch (_) { return; }
     shell.showItemInFolder(absPath);
+});
+
+// ==================== 应用内更新 (下载 → 安装 → 重启) ====================
+
+/** 允许下载到/执行安装包的位置: 只认我们自己建的临时目录 (安装版) 或当前 exe 所在目录 (便携版) */
+const trustedUpdateDirs = new Set();
+/** 当前下载任务 (同一时刻只允许一个): { cancelled, destPath } */
+let updateTask = null;
+
+const sendToWin = (channel, payload) => {
+    if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+};
+
+/** 前端问"我现在是什么运行环境" —— 决定能不能自动安装 */
+ipcMain.handle('runtime-info', () => ({
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    portable: IS_PORTABLE,
+    updatedRun: IS_UPDATED_RUN,
+    exePath: app.getPath('exe'),
+    // 安装版: 安装目录就是 exe 所在目录 (NSIS 一键安装固定装在这里); 便携版/开发模式为空
+    installDir: app.isPackaged && !IS_PORTABLE ? path.dirname(app.getPath('exe')) : '',
+}));
+
+/**
+ * 拉取更新清单 (latest.json)。
+ * 必须在主进程做: 清单常放在第三方站点, 很多站点没配 CORS 头, 渲染进程的 fetch
+ * 会被浏览器同源策略拦掉 —— 表现就是"自建源永远不可用", 只能退到 GitHub。
+ */
+ipcMain.handle('update-fetch-manifest', async (_, url) => {
+    const target = String(url || '').trim();
+    if (!/^https?:\/\//i.test(target)) return { ok: false, error: '地址不合法' };
+    try {
+        const manifest = await fetchJson(target, { timeoutMs: 8000 });
+        if (!manifest || !String(manifest.version || '').trim()) return { ok: false, error: '清单缺少 version 字段' };
+        return { ok: true, manifest };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+});
+
+/**
+ * 下载更新包。安装版落到临时目录; 便携版落到当前 exe 旁边
+ * (便携版没法覆盖正在运行的自己, 只能下好让用户关掉程序后双击新文件)。
+ * 进度通过 update-download-progress 事件推给界面。
+ */
+ipcMain.handle('update-download', async (_, payload) => {
+    const url = String((payload && payload.url) || '').trim();
+    if (!/^https?:\/\//i.test(url)) return { ok: false, error: '下载地址不合法' };
+
+    // myTask 必须声明在 try 之外: finally 里要用它比对, 声明在 try 内会变成
+    // "myTask is not defined", IPC 直接 reject, 界面就永远停在"正在下载"
+    let myTask = null;
+    let destDir;
+    try {
+        if (IS_PORTABLE) {
+            destDir = path.dirname(app.getPath('exe'));
+        } else {
+            destDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agnes-update-'));
+        }
+        trustedUpdateDirs.add(path.resolve(destDir));
+        const destPath = path.join(destDir, fileNameFromUrl(url));
+        // 同一时刻只允许一个下载: 用户关掉弹窗再打开会发起第二次, 这里把上一次取消掉,
+        // 免得两个下载各自推进度、还互相把对方的任务状态清掉
+        if (updateTask) updateTask.cancelled = true;
+        myTask = { cancelled: false, destPath };
+        updateTask = myTask;
+        console.log(`[Update] 开始下载更新包: ${url}`);
+        sendToWin('update-download-progress', { phase: 'start', percent: 0, received: 0, total: null, speed: 0 });
+
+        const res = await downloadToFile(url, destPath, {
+            onProgress: (p) => { if (!myTask.cancelled) sendToWin('update-download-progress', { phase: 'progress', ...p }); },
+            isCancelled: () => myTask.cancelled,
+        });
+
+        if (!looksLikeInstaller(res.path)) {
+            try { fs.unlinkSync(res.path); } catch (_) { /* 忽略 */ }
+            console.error(`[Update] 下载到的文件不像安装包, 已删除: ${res.path}`);
+            sendToWin('update-download-progress', { phase: 'error', error: '下载到的文件不像安装包' });
+            return { ok: false, error: '下载到的文件不像安装包，请改从项目主页手动下载' };
+        }
+        console.log(`[Update] 下载完成: ${res.path} (${res.bytes} 字节)`);
+        sendToWin('update-download-progress', { phase: 'done', percent: 100, received: res.bytes, total: res.bytes, speed: 0 });
+        return { ok: true, path: res.path, bytes: res.bytes, portable: IS_PORTABLE, installDir: path.dirname(app.getPath('exe')) };
+    } catch (e) {
+        console.error(`[Update] 下载失败: ${e.message}`);
+        sendToWin('update-download-progress', { phase: 'error', error: e.message });
+        return { ok: false, error: e.message };
+    } finally {
+        if (updateTask === myTask) updateTask = null;
+    }
+});
+
+ipcMain.handle('update-cancel', () => {
+    if (updateTask) updateTask.cancelled = true;
+    return true;
+});
+
+/**
+ * 运行安装包并退出本程序。
+ * 参数按 electron-builder 生成的一键安装包约定:
+ *   --updated    已经知道本程序在跑, 不必弹"请先关闭"的对话框 (它会结束旧进程)
+ *   --force-run  装完自动把应用重新拉起来 (这样用户看到的就是"更新完自动重启")
+ * 安装目录不额外指定 —— 一键安装包固定装在用户目录下 (perMachine=false),
+ * 也就是上一次的安装路径, 与"按之前的安装路径"一致。
+ */
+ipcMain.handle('update-install', async (_, payload) => {
+    const filePath = String((payload && payload.path) || '');
+    const dir = path.resolve(path.dirname(filePath));
+    if (!trustedUpdateDirs.has(dir) || !looksLikeInstaller(filePath)) {
+        return { ok: false, error: '安装包路径不合法' };
+    }
+    const child = spawn(filePath, ['--updated', '--force-run'], {
+        detached: true,
+        stdio: 'ignore',
+        cwd: dir,
+    });
+    child.unref();
+    console.log(`[Update] 启动安装包: ${filePath} (--updated --force-run), 本程序即将退出`);
+    // 立刻退出: 安装包随后会结束本进程 (更稳) 或等它自己退出后再覆盖文件
+    setTimeout(() => { try { app.quit(); } catch (_) { /* 已退出 */ } }, 800);
+    return { ok: true };
+});
+
+// 在资源管理器中定位本机文件 (便携版下载完用"打开所在文件夹"引导用户)
+ipcMain.handle('update-reveal', async (_, filePath) => {
+    const target = String(filePath || '');
+    const dir = path.resolve(path.dirname(target));
+    if (!trustedUpdateDirs.has(dir)) return { ok: false, error: '路径不合法' };
+    try { shell.showItemInFolder(target); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
+});
+
+// 用系统浏览器打开更新下载页 (服务器模式/不便自动安装时的兜底)
+ipcMain.handle('update-open-url', async (_, url) => {
+    const target = String(url || '').trim();
+    if (!/^https?:\/\//i.test(target)) return { ok: false, error: '地址不合法' };
+    try { await shell.openExternal(target); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
 });
 
 // ==================== 文件选择对话框 ====================

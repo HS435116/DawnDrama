@@ -107,5 +107,43 @@ contextBridge.exposeInMainWorld('electronAPI', {
                 reject(new Error('批量合并超时'));
             }, 30 * 60 * 1000); // 30分钟超时
         });
-    }
+    },
+
+    // ==================== 应用内更新 (下载 → 安装 → 重启) ====================
+
+    /** 运行环境: 版本号 / 是否安装版 / 安装目录 / 是否刚更新完启动 */
+    runtimeInfo: () => ipcRenderer.invoke('runtime-info'),
+
+    /**
+     * 拉取更新清单 (latest.json)。走主进程, 不受浏览器同源策略限制 ——
+     * 更新清单常放在没配 CORS 头的第三方站点, 渲染进程直接 fetch 会被拦住。
+     * @param {string} url
+     * @returns {Promise<{ok: boolean, manifest?: object, error?: string}>}
+     */
+    updateFetchManifest: (url) => ipcRenderer.invoke('update-fetch-manifest', url),
+
+    /**
+     * 下载更新包, 进度通过 onProgress 回调陆续给出 (主进程已节流)
+     * @param {{url: string}} payload
+     * @param {(p: {phase: string, percent: number|null, received: number, total: number|null, speed: number, error?: string}) => void} [onProgress]
+     * @returns {Promise<{ok: boolean, path?: string, bytes?: number, portable?: boolean, installDir?: string, error?: string}>}
+     */
+    updateDownload: (payload, onProgress) => {
+        const handler = onProgress ? (_, p) => onProgress(p) : null;
+        if (handler) ipcRenderer.on('update-download-progress', handler);
+        return ipcRenderer.invoke('update-download', payload)
+            .finally(() => { if (handler) ipcRenderer.removeListener('update-download-progress', handler); });
+    },
+
+    /** 取消正在进行的下载 */
+    updateCancel: () => ipcRenderer.invoke('update-cancel'),
+
+    /** 运行安装包并按之前的安装路径升级, 装完自动重启 (本程序会先退出) */
+    updateInstall: (filePath) => ipcRenderer.invoke('update-install', { path: filePath }),
+
+    /** 在资源管理器中定位已下载的更新包 (便携版引导用户手动运行) */
+    updateReveal: (filePath) => ipcRenderer.invoke('update-reveal', filePath),
+
+    /** 用系统浏览器打开下载页 (无法自动安装时的兜底) */
+    updateOpenUrl: (url) => ipcRenderer.invoke('update-open-url', url)
 });

@@ -1012,6 +1012,31 @@ input[type="checkbox"] {
     background: #0b1220;
 }
 
+/* 版本更新: 功能说明与"可更新"标记 */
+.update-notes {
+    margin-top: 10px;
+    max-height: 240px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    line-height: 1.8;
+    font-size: 0.9rem;
+    background: var(--surface-color);
+    border: 1px solid var(--surface-hover);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+}
+
+.update-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #fff;
+    background: var(--primary-color);
+}
+
 .status-badge {
     position: absolute;
     top: 10px;

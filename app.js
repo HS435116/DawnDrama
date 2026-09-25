@@ -16,13 +16,17 @@
  */
 
 // ================= 版本信息 =================
-const APP_VERSION = '2.8.7';
+const APP_VERSION = '2.8.8';
 // 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date"})
 // 发布新版本时的检查清单:
 //   1) bump 本文件的 APP_VERSION、package.json 的 version、server.js 的 APP_VERSION
-//   2) 把 latest.json 的 version 改成新版本号, 并在 notes 写更新说明
+//   2) 把 latest.json 的 version 改成新版本号, 并在 notes 写更新说明; history 保留最近 5 条
 //      (清单版本必须 > 用户当前版本, 老版本用户才会收到提醒)
-//   3) url 留空表示"暂无下载地址", 界面会引导用户去项目主页
+//   3) url 指向安装包、portableUrl 指向便携包 (便携版客户端据此取对应文件);
+//      url 留空表示"暂无下载地址", 界面会引导用户去项目主页
+//   4) 安装包上传到下载站后, 记得把**下载站上的 latest.json 也同步成新版**:
+//      老客户端会优先读站点那份清单, 站点长期不更新 (曾停在 2.8.3) 会让老用户收不到提醒;
+//      v2.8.8 起客户端会继续核对其它更新源并取版本号更高的那份, 但站点仍应保持同步。
 // 更新清单候选地址 (按顺序尝试, 第一个成功的即生效):
 //   1) 自建下载站 —— 国内可达, 与安装包同一域名
 //   2) GitHub raw  —— 备用源 (部分网络下不可达, 所以放后面)
@@ -115,6 +119,17 @@ class AgnesVideoGenerator {
 
         // 版本更新检查 (静默; 有新版本时入口闪烁并弹窗一次, 不影响使用)
         this.checkForUpdates(true);
+
+        // 桌面端: 记下运行环境 (便携版/安装版、安装目录) —— 更新弹窗据此决定能否自动安装、装到哪;
+        // 刚被安装包装上来的 (NSIS 会带 --updated 启动) 提示一句, 让用户知道升级已完成
+        if (window.electronAPI && window.electronAPI.runtimeInfo) {
+            try {
+                this._runtimeInfo = await window.electronAPI.runtimeInfo();
+                if (this._runtimeInfo && this._runtimeInfo.updatedRun) {
+                    this.showStatus('✅ 已完成更新，当前版本 v' + APP_VERSION + '。更新内容可在"🔄 版本更新"页查看', 'success');
+                }
+            } catch (_) { /* 拿不到不影响任何功能 */ }
+        }
 
         // 恢复未完成任务的轮询
         this.resumePendingTasks();
@@ -2314,6 +2329,16 @@ class AgnesVideoGenerator {
      * @returns {Promise<object|null>} 清单对象 (必须含 version), 失败返回 null
      */
     async _fetchManifest(url) {
+        // 桌面端走主进程拉清单: 更新清单常托管在第三方站点, 很多站点没配 CORS 头,
+        // 渲染进程的 fetch 会被浏览器同源策略拦掉 (实测自建下载站就是如此 —— 于是"站点优先"
+        // 形同虚设, 每次都只能退到 GitHub)。主进程用 Node 发请求, 不受同源策略限制。
+        if (window.electronAPI && window.electronAPI.updateFetchManifest) {
+            const r = await window.electronAPI.updateFetchManifest(url);
+            if (!r || !r.ok) throw new Error((r && r.error) || '拉取更新清单失败');
+            const manifest = r.manifest;
+            if (!String(manifest && manifest.version || '').trim()) throw new Error('清单缺少 version 字段');
+            return manifest;
+        }
         const ac = new AbortController();
         const timer = setTimeout(() => { try { ac.abort(); } catch (_) { /* 已结束 */ } }, 6000);
         try {
@@ -2345,20 +2370,35 @@ class AgnesVideoGenerator {
             return null;
         }
         if (!silent && result) { result.textContent = '🔍 正在检查更新...'; result.className = 'status-message warning'; result.style.display = 'block'; }
+        const btn = document.getElementById('update-check-btn');
+        if (btn) { btn.disabled = true; btn.textContent = '⏳ 检查中...'; }
+        // 无论成功、失败还是没新版本, 这里都必须把结果写回去 —— 以前只更新了底部状态栏,
+        // #update-result 一直停在"🔍 正在检查更新...", 用户看到的就是"点了没反应/卡住"
+        const finish = (msg, cls) => {
+            if (!silent && result) { result.textContent = msg; result.className = 'status-message ' + cls; result.style.display = 'block'; }
+            if (btn) { btn.disabled = false; btn.textContent = '🔍 检查更新'; }
+        };
         try {
-            // 逐个候选尝试: 单个源不可达/超时/清单不合法就换下一个, 全部失败才放弃
-            let manifest = null, url = '';
+            // 逐个候选尝试。只要某份清单比当前版本新就收工 (自建站正常时不必再打扰仓库);
+            // 若某份清单并不比当前版本新 (自建站上的 latest.json 曾长期停在 2.8.3), 就继续看下一个源,
+            // 最后取可用清单里版本号最高的那份 —— 以前是"第一个能连上的就拍板",
+            // 于是新版本发布后老用户永远收不到提醒。
+            const manifests = [];
             for (const cand of candidates) {
                 try {
                     const r = await this._fetchManifest(cand);
-                    if (r) { manifest = r; url = cand; break; }
+                    if (!r) continue;
+                    manifests.push({ url: cand, manifest: r });
+                    if (this.compareVersions(String(r.version || ''), APP_VERSION) > 0) break;
                 } catch (e) { console.warn(`更新源不可用 (${cand}): ${e.message}`); }
             }
-            if (!manifest) throw new Error('所有更新源均不可用');
+            if (!manifests.length) throw new Error('所有更新源均不可用');
+            manifests.sort((a, b) => this.compareVersions(String(b.manifest.version), String(a.manifest.version)));
+            const { url, manifest } = manifests[0];
             this._manifestUrlUsed = url;
             const latest = String(manifest.version || '').trim();
             if (!latest) throw new Error('清单缺少 version 字段');
-            const info = { version: latest, notes: String(manifest.notes || ''), url: String(manifest.url || ''), date: String(manifest.date || '') };
+            const info = { version: latest, notes: String(manifest.notes || ''), url: String(manifest.url || ''), date: String(manifest.date || ''), portableUrl: String(manifest.portableUrl || '') };
             this._updateInfo = info;
             // 把清单里的 history (+当前这条) 并进"最近 5 条版本记录", 供版本更新页长期展示 (离线也在)
             this._mergeUpdateHistory(manifest, info);
@@ -2371,7 +2411,7 @@ class AgnesVideoGenerator {
                     localStorage.setItem('agnes_update_seen', latest);
                     const go = await this.showConfirm({
                         title: '🎉 发现新版本 v' + latest,
-                        message: '当前版本: v' + APP_VERSION + '\n最新版本: v' + latest + (info.date ? ' (' + info.date + ')' : '') + '\n\n' + (info.notes || '点击查看更新内容。') + '\n\n点击"查看更新"前往版本更新页。旧版本可继续正常使用。',
+                        message: '当前版本: v' + APP_VERSION + '\n最新版本: v' + latest + (info.date ? ' (发布于 ' + info.date + ')' : '') + '\n\n' + (info.notes || '点击查看更新内容。') + '\n\n点"查看更新"可直接在本程序里下载安装；旧版本也可继续正常使用。',
                         okText: '查看更新'
                     });
                     if (go) this.showUpdatePage();
@@ -2381,47 +2421,54 @@ class AgnesVideoGenerator {
                 tab.style.display = '';
                 tab.classList.remove('update-blink');
             }
+            finish(isNew
+                ? '🎉 发现新版本 v' + latest + (info.date ? '（发布于 ' + info.date + '）' : '') + '，点"⬇️ 立即更新"即可在本程序里下载安装'
+                : '✅ 已是最新版本 v' + APP_VERSION, 'success');
             if (!silent) this.showStatus(isNew
                 ? '🎉 发现新版本 v' + latest + ' (当前 v' + APP_VERSION + ')，请到"版本更新"页获取'
                 : '✅ 已是最新版本 v' + APP_VERSION, 'success');
+            // 更新页正开着的话, 把"版本信息"区刷新成刚查到的结果
+            const page = document.getElementById('update');
+            if (page && page.classList.contains('active')) this.renderUpdateInfo();
             return info;
         } catch (e) {
+            finish('❌ 无法连接更新源 (' + e.message + ')。不影响当前版本使用，可稍后再试或离线使用', 'warning');
             if (!silent) this.showStatus('❌ 无法连接更新源 (' + e.message + ')。不影响当前版本使用，可稍后再试或离线使用', 'warning');
             return null;
         }
     }
 
     showUpdatePage() {
-        let info = this._updateInfo;
-        if (!info) { try { info = JSON.parse(localStorage.getItem('agnes_update_info') || 'null'); } catch (_) {} }
         this.switchTab('update');
+        this.renderUpdatePage();
+        // 点进"版本更新"就是奔着更新来的: 有新版本就把下载弹窗一起带出来 (自动开始下载)。
+        // 用户点过"稍后"的那个版本不再自动弹, 页面里的"⬇️ 立即更新"按钮仍可手动触发。
+        const info = this._updateInfo;
+        if (info && info.url && this.compareVersions(String(info.version), APP_VERSION) > 0
+            && !this._updateDeferred(info.version)) {
+            setTimeout(() => this.openUpdateDialog(), 80);
+        }
+    }
+
+    /** 渲染整个"版本更新"页 (信息区后续可单独刷新, 不必整页重画) */
+    renderUpdatePage() {
         const body = document.getElementById('update-body');
         if (!body) return;
         const url = localStorage.getItem('agnes_update_url') || this._manifestUrlUsed || UPDATE_MANIFEST_URLS[0];
-        let infoHtml = '';
-        if (info) {
-            infoHtml = '<div class="info-row"><span class="info-label">最新版本:</span><span class="info-value">v' + this.escapeHtml(info.version) + (info.date ? ' (' + this.escapeHtml(info.date) + ')' : '') + '</span></div>'
-                + (info.notes ? '<div class="confirm-message" style="margin-top:10px;">' + this.escapeHtml(info.notes) + '</div>' : '')
-                // 清单里提供了下载地址就给链接; 没提供就引导去项目主页, 而不是留空让人不知道去哪升级
-                + (info.url
-                    ? '<div class="info-row"><span class="info-label">下载地址:</span><span class="info-value"><a href="' + this.escapeAttr(info.url) + '" target="_blank" rel="noopener" style="color: var(--primary-color);">前往下载 ↗</a></span></div>'
-                    : '<div class="info-row"><span class="info-label">下载地址:</span><span class="info-value" style="color: var(--text-muted);">暂未提供，请前往 <a href="' + PROJECT_HOMEPAGE + '" target="_blank" rel="noopener" style="color: var(--primary-color);">项目主页</a> 获取最新版本</span></div>');
-        }
         body.innerHTML =
             '<div class="settings-section">' +
                 '<h3>📌 版本信息</h3>' +
-                '<div class="info-row"><span class="info-label">当前版本:</span><span class="info-value">v' + APP_VERSION + '</span></div>' +
-                infoHtml +
+                '<div id="update-info">' + this.updateInfoHtml() + '</div>' +
             '</div>' +
             '<div class="settings-section">' +
                 '<h3>🔍 检查更新</h3>' +
                 '<div class="form-group">' +
                     '<label for="update-url-input">更新清单地址 (latest.json 格式: version/notes/url)</label>' +
                     '<input type="text" id="update-url-input" value="' + this.escapeAttr(url) + '" placeholder="https://你的域名/latest.json">' +
-                    '<small>默认优先使用自建下载站的 latest.json (另一个内置备用源为项目仓库)；填入自定义地址后只用你填的这一个。留空或不可达时不影响任何功能使用</small>' +
+                    '<small>默认会同时检查内置的两个更新源（自建下载站 + 项目仓库），取版本号更高的那份清单；填入自定义地址后只用你填的这一个。留空或不可达时不影响任何功能使用</small>' +
                 '</div>' +
                 '<div class="form-actions" style="border: none; padding-top: 10px;">' +
-                    '<button class="btn btn-primary" onclick="checkForUpdates()">🔍 检查更新</button>' +
+                    '<button class="btn btn-primary" id="update-check-btn" onclick="checkForUpdates()">🔍 检查更新</button>' +
                 '</div>' +
                 '<div id="update-result" class="status-message"></div>' +
             '</div>' +
@@ -2429,11 +2476,257 @@ class AgnesVideoGenerator {
                 '<h3>ℹ️ 关于升级</h3>' +
                 '<p style="color: var(--text-muted); font-size: 0.9rem; line-height: 1.8;">' +
                 '· 检查更新为可选功能，检查失败或离线时<b>不影响旧版本任何功能</b>。<br>' +
-                '· 新版本发布后，顶部"🔄 版本更新"入口会闪烁提醒并弹窗一次；下载新执行文件替换旧文件即完成升级，<b>作品、剧本存档与设置全部保留</b>。<br>' +
-                '· 最新版本可在 <a href="' + PROJECT_HOMEPAGE + '" target="_blank" rel="noopener" style="color: var(--primary-color);">项目主页</a> 获取。<br>' +
+                '· 检测到新版本后，点"⬇️ 立即更新"会在本程序内自动下载：带进度条，下完点"🔧 立即安装并重启"即可装到原来的安装路径，装完自动打开新版本；<b>作品、剧本存档与设置全部保留</b>。<br>' +
+                '· 便携版（单文件 exe）无法覆盖正在运行的文件，会下载好新版并引导你关闭本程序后手动运行。<br>' +
+                '· 最新版本也可在 <a href="' + PROJECT_HOMEPAGE + '" target="_blank" rel="noopener" style="color: var(--primary-color);">项目主页</a> 获取。<br>' +
                 '· 版权所有 © 2026  晨曦微光工作室</p>' +
             '</div>' +
-            this.updateHistorySection();
+            '<div id="update-history">' + this.updateHistorySection() + '</div>';
+        this.renderUpdateInfo();
+        this.renderUpdateHistory();
+    }
+
+    /** 更新页的"版本信息"区 (整页渲染时内联, 查完更新后可单独刷新这一块) */
+    updateInfoHtml() {
+        const info = this._updateInfo;
+        if (!info) {
+            return '<div class="info-row"><span class="info-label">最新版本:</span>'
+                + '<span class="info-value" style="color: var(--text-muted);">点下方"检查更新"获取最新版本信息</span></div>';
+        }
+        const isNew = this.compareVersions(String(info.version), APP_VERSION) > 0;
+        const desktop = !!(window.electronAPI && window.electronAPI.updateDownload);
+        let action = '';
+        if (isNew && info.url) {
+            action = desktop
+                ? '<button class="btn btn-primary" onclick="generator.openUpdateDialog()">⬇️ 立即更新</button>'
+                : '<button class="btn btn-primary" onclick="generator.openUpdateDialog()">⬇️ 前往下载</button>';
+        }
+        return '<div class="info-row"><span class="info-label">当前版本:</span><span class="info-value">v' + this.escapeHtml(APP_VERSION) + '</span></div>'
+            + '<div class="info-row"><span class="info-label">最新版本:</span><span class="info-value">v' + this.escapeHtml(info.version)
+                + (info.date ? ' （发布于 ' + this.escapeHtml(info.date) + '）' : '')
+                + (isNew ? ' <span class="update-badge">可更新</span>' : ' <span style="color: var(--text-muted);">已是最新</span>')
+            + '</span></div>'
+            + (info.notes ? '<div class="update-notes">' + this.escapeHtml(info.notes) + '</div>' : '')
+            + (isNew && !info.url
+                ? '<div class="info-row"><span class="info-label">下载地址:</span><span class="info-value" style="color: var(--text-muted);">暂未提供，请前往 <a href="' + PROJECT_HOMEPAGE + '" target="_blank" rel="noopener" style="color: var(--primary-color);">项目主页</a> 获取</span></div>'
+                : '')
+            + (action ? '<div class="form-actions" style="border: none; padding-top: 6px;">' + action + '</div>' : '');
+    }
+
+    renderUpdateInfo() {
+        const box = document.getElementById('update-info');
+        if (box) box.innerHTML = this.updateInfoHtml();
+    }
+
+    /** 这个版本用户是否说过"稍后" (说过就不再自动弹下载窗, 但仍可手动点) */
+    _updateDeferred(version) {
+        try { return localStorage.getItem('agnes_update_later') === String(version); } catch (_) { return false; }
+    }
+
+    _deferUpdate(version) {
+        try { localStorage.setItem('agnes_update_later', String(version)); } catch (_) { /* 隐私模式 */ }
+    }
+
+    /** 把"最近 5 条版本记录"填进更新页; 清单还没拉到时会用本地缓存 */
+    renderUpdateHistory() {
+        const box = document.getElementById('update-history');
+        if (box) box.innerHTML = this.updateHistorySection();
+    }
+
+    /* ================= 应用内更新: 下载 → 安装 → 重启 ================= */
+
+    /**
+     * 更新弹窗: 新版本详情 (版本号/发布时间/功能说明) + 下载进度条 + 安装重启。
+     * 桌面端打开即自动开始下载; 纯浏览器(服务器)模式没有安装能力, 直接引导去下载页。
+     */
+    openUpdateDialog() {
+        const info = this._updateInfo || this._cachedUpdateInfo();
+        if (!info) return;
+        const modal = document.getElementById('modal');
+        const body = document.getElementById('modal-body');
+        if (!modal || !body) return;
+        this._updateDialogOpen = true;
+        this._updateDownload = null;          // 本次下载结果 {path, bytes, portable}
+        this._updateProgress = null;
+
+        const desktop = !!(window.electronAPI && window.electronAPI.updateDownload);
+        const isNew = this.compareVersions(String(info.version), APP_VERSION) > 0;
+        body.innerHTML =
+            '<h2 style="margin-bottom: 6px;">🎉 发现新版本 v' + this.escapeHtml(info.version) + '</h2>'
+            + '<div style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 12px;">'
+                + '当前版本 v' + this.escapeHtml(APP_VERSION)
+                + (info.date ? ' · 新版本发布于 ' + this.escapeHtml(info.date) : '') + '</div>'
+            + '<div class="update-notes">' + this.escapeHtml(info.notes || '（该版本未记录更新说明）') + '</div>'
+            + '<div id="update-progress-wrap" style="display: none; margin-top: 16px;">'
+                + '<div class="progress-bar" style="height: 18px;"><div id="update-progress-fill" class="progress-fill" style="width: 0%;"></div></div>'
+                + '<div id="update-progress-text" class="progress-text">准备下载...</div>'
+            + '</div>'
+            + '<div id="update-dialog-status" class="status-message" style="display: none;"></div>'
+            + '<div class="form-actions" style="border: none; padding-top: 16px;">'
+                + '<button class="btn btn-primary" id="update-install-btn" style="display: none;">🔧 立即安装并重启</button>'
+                + '<button class="btn btn-secondary" id="update-cancel-btn" style="display: none;">取消下载</button>'
+                + '<button class="btn btn-secondary" id="update-later-btn">稍后</button>'
+                + '<button class="btn btn-secondary" id="update-reveal-btn" style="display: none;">📂 打开所在文件夹</button>'
+            + '</div>';
+
+        const later = document.getElementById('update-later-btn');
+        if (later) later.onclick = () => { this._onUpdateLater(info); };
+        const installBtn = document.getElementById('update-install-btn');
+        if (installBtn) installBtn.onclick = () => this.installUpdateNow();
+        const revealBtn = document.getElementById('update-reveal-btn');
+        if (revealBtn) revealBtn.onclick = () => {
+            const p = this._updateDownload && this._updateDownload.path;
+            if (p && window.electronAPI.updateReveal) window.electronAPI.updateReveal(p);
+        };
+        const cancelBtn = document.getElementById('update-cancel-btn');
+        if (cancelBtn) cancelBtn.onclick = () => {
+            if (window.electronAPI.updateCancel) window.electronAPI.updateCancel();
+        };
+        modal.style.display = 'block';
+
+        if (!desktop) {
+            // 浏览器/服务器模式: 没有安装能力, 直接给下载入口 (不假装能自动装)
+            this._setUpdateDialogStatus(info.url
+                ? '💡 当前是浏览器模式，无法自动安装。点下面按钮用系统浏览器下载新版本，下载后关闭本程序并运行安装包即可（作品与设置都会保留）。'
+                : '💡 当前是浏览器模式，且清单未提供下载地址，请前往项目主页获取最新版本。', 'info');
+            if (cancelBtn) cancelBtn.style.display = '';
+            if (cancelBtn) cancelBtn.textContent = info.url ? '前往下载' : '关闭';
+            if (cancelBtn) cancelBtn.onclick = () => {
+                if (info.url) window.open(info.url, '_blank', 'noopener');
+                else window.open(PROJECT_HOMEPAGE, '_blank', 'noopener');
+            };
+            return;
+        }
+        if (!isNew || !info.url) {
+            this._setUpdateDialogStatus(isNew
+                ? '⚠️ 清单里没有提供下载地址，请前往项目主页手动更新。'
+                : '✅ 当前已是最新版本。', isNew ? 'warning' : 'success');
+            return;
+        }
+        // 桌面端: 打开即自动开始下载 (用户点"版本更新"就是来更新的)
+        if (cancelBtn) cancelBtn.style.display = '';
+        this.startUpdateDownload(info);
+    }
+
+    _cachedUpdateInfo() {
+        try { return JSON.parse(localStorage.getItem('agnes_update_info') || 'null'); } catch (_) { return null; }
+    }
+
+    _onUpdateLater(info) {
+        this._deferUpdate(info && info.version);
+        if (window.electronAPI && window.electronAPI.updateCancel) window.electronAPI.updateCancel();
+        this._updateDialogOpen = false;
+        this.closeModal();
+        this.showStatus('已选择稍后更新。需要时到"🔄 版本更新"页点"⬇️ 立即更新"即可', 'info');
+    }
+
+    _setUpdateDialogStatus(text, type = 'info') {
+        const box = document.getElementById('update-dialog-status');
+        if (!box) return;
+        box.textContent = text;
+        box.className = 'status-message ' + type;
+        box.style.display = 'block';
+    }
+
+    /** 运行环境 (便携版/安装版): 启动时已取过就用缓存, 没有就现问一次 (决定取哪个包/能否自动安装) */
+    async _runtime() {
+        if (this._runtimeInfo) return this._runtimeInfo;
+        if (window.electronAPI && window.electronAPI.runtimeInfo) {
+            try { this._runtimeInfo = await window.electronAPI.runtimeInfo(); } catch (_) { /* 拿不到按"安装版"处理 */ }
+        }
+        return this._runtimeInfo || {};
+    }
+
+    /** 桌面端: 便携版取便携包, 安装版取安装包 (便携版没有便携包就退回安装包) */
+    async _updateDownloadUrl(info) {
+        const rt = await this._runtime();
+        if (rt.portable && info.portableUrl) return info.portableUrl;
+        return info.url || info.portableUrl || '';
+    }
+
+    async startUpdateDownload(info) {
+        const url = await this._updateDownloadUrl(info);
+        if (!url) { this._setUpdateDialogStatus('⚠️ 清单里没有提供下载地址，请前往项目主页手动更新。', 'warning'); return; }
+        if (!window.electronAPI || !window.electronAPI.updateDownload) {
+            window.open(url, '_blank', 'noopener');
+            return;
+        }
+        const wrap = document.getElementById('update-progress-wrap');
+        if (wrap) wrap.style.display = 'block';
+        this._renderUpdateProgress({ phase: 'start', percent: 0, received: 0, total: null, speed: 0 });
+        const cancelBtn = document.getElementById('update-cancel-btn');
+        if (cancelBtn) cancelBtn.style.display = '';
+        this._setUpdateDialogStatus('⬇️ 正在下载更新包，请保持网络畅通（下载期间可继续使用其他功能）', 'info');
+
+        // 下载走主进程 IPC: 出错(或 IPC 本身异常) 也要如实反馈, 绝不能让窗口停在"正在下载"
+        let res = null;
+        try {
+            res = await window.electronAPI.updateDownload({ url }, (p) => this._renderUpdateProgress(p));
+        } catch (e) {
+            res = { ok: false, error: e && e.message ? e.message : String(e) };
+        }
+        const installBtn = document.getElementById('update-install-btn');
+        if (cancelBtn) cancelBtn.style.display = 'none';
+        if (!res || !res.ok) {
+            this._setUpdateDialogStatus('❌ 下载失败: ' + ((res && res.error) || '未知错误') + '。可稍后重试，或用系统浏览器手动下载。', 'warning');
+            return;
+        }
+        this._updateDownload = res;
+        this._renderUpdateProgress({ phase: 'done', percent: 100, received: res.bytes, total: res.bytes, speed: 0 });
+        const revealBtn = document.getElementById('update-reveal-btn');
+        if (res.portable) {
+            // 便携版是单文件 exe, 正在运行时没法覆盖自己 —— 下好让用户关掉程序后运行新文件
+            if (installBtn) installBtn.style.display = 'none';
+            this._setUpdateDialogStatus('✅ 已下载完成：' + res.path + '\n便携版无法自动覆盖正在运行的文件：请关闭本程序后双击该文件运行新版本（作品、剧本与设置都在作品库目录里，不受影响）。', 'success');
+            if (revealBtn) revealBtn.style.display = '';
+        } else {
+            this._setUpdateDialogStatus('✅ 下载完成（' + this._formatBytes(res.bytes) + '）。点"🔧 立即安装并重启"完成升级：程序会先退出，安装到原来的安装路径，装完自动打开新版本；作品、剧本存档与设置全部保留。', 'success');
+            if (installBtn) installBtn.style.display = 'block';
+        }
+    }
+
+    _renderUpdateProgress(p) {
+        this._updateProgress = p;
+        const fill = document.getElementById('update-progress-fill');
+        const text = document.getElementById('update-progress-text');
+        if (!fill || !text) return;
+        const pct = p.percent == null ? 0 : p.percent;
+        fill.style.width = pct + '%';
+        if (p.phase === 'done') { text.textContent = '✅ 下载完成 ' + this._formatBytes(p.received); return; }
+        if (p.phase === 'error') { text.textContent = '❌ ' + (p.error || '下载失败'); return; }
+        const mb = this._formatBytes(p.received) + (p.total ? ' / ' + this._formatBytes(p.total) : '');
+        const speed = p.speed ? ' · ' + this._formatBytes(p.speed) + '/s' : '';
+        text.textContent = (p.total ? pct + '%  ' : '已下载 ') + mb + speed;
+    }
+
+    _formatBytes(n) {
+        const v = Number(n) || 0;
+        if (v >= 1024 * 1024 * 1024) return (v / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+        if (v >= 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + ' MB';
+        if (v >= 1024) return (v / 1024).toFixed(0) + ' KB';
+        return v + ' B';
+    }
+
+    /** 确认后运行安装包并按原路径升级, 装完自动重启 (本程序随即退出) */
+    async installUpdateNow() {
+        const dl = this._updateDownload;
+        if (!dl || !dl.path || !window.electronAPI || !window.electronAPI.updateInstall) return;
+        const dir = dl.installDir || this._runtimeInfo && this._runtimeInfo.installDir || '原安装目录';
+        const ok = await this.showConfirm({
+            title: '🔧 立即安装并重启？',
+            message: '将执行:\n1) 关闭本程序\n2) 把 v' + ((this._updateInfo && this._updateInfo.version) || '') + ' 安装到原来的目录: ' + dir
+                + '\n3) 安装完成后自动打开新版本\n\n作品、剧本存档与设置全部保留。安装过程中请不要断电或强制关机。',
+            okText: '立即安装并重启',
+            cancelText: '稍后再说',
+        });
+        if (!ok) return;
+        this._setUpdateDialogStatus('🔧 正在启动安装程序，本程序即将退出…', 'success');
+        const res = await window.electronAPI.updateInstall(dl.path);
+        if (res && res.ok === false) {
+            this._setUpdateDialogStatus('❌ 安装启动失败: ' + (res.error || '未知错误') + '，可点"打开所在文件夹"手动运行安装包。', 'warning');
+            const revealBtn = document.getElementById('update-reveal-btn');
+            if (revealBtn) revealBtn.style.display = '';
+        }
     }
 
     /**

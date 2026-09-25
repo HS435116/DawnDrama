@@ -16,9 +16,11 @@ Multi-Platform AI Video Batch Generation Tool
 版本升级
 
 - 首页右上角"🔄 版本更新"入口：有新版本时**闪烁提醒并弹窗一次**，无新版本时自动隐藏；
+- **程序内一键更新**：检测到新版本后点"⬇️ 立即更新"（或直接点闪烁的入口）弹出更新窗口，**自动下载并显示进度条**（百分比 / 已下载 / 速度，可随时取消）；下载期间可继续使用其他功能；
+- **装到原路径并自动重启**：点"🔧 立即安装并重启"后程序先退出 → 静默安装到原来的安装路径 → 自动打开新版本；`output/` 作品、剧本存档与设置全部保留；
+- 便携版（单文件 exe）无法覆盖正在运行的文件：会把新版下载到程序旁边并引导你关闭本程序后运行新文件；
 - 检查更新为可选功能，离线/检查失败**不影响旧版本任何功能**；
-- 升级方式：下载新执行文件替换旧文件即可，`output/` 作品与剧本存档全部保留；
-- 发布者：把 `latest.json`（版本/说明/下载地址）托管到任意可访问地址，并在 `app.js` 顶部 `DEFAULT_UPDATE_MANIFEST_URL` 填入该地址。
+- **发布者发版清单**：① 打包 `npm run desktop:build`；② 更新 `latest.json`（`version` 必须大于线上版本，`url` 指安装包、`portableUrl` 指便携包，`history` 保留最近 5 条）；③ 把安装包/便携包上传到下载站；④ **同时把下载站上的 `latest.json` 也更新成新版** —— 老客户端会优先读站点那份清单，站点长期不更新（曾停在 2.8.3）会让老用户一直收不到更新提醒。
 
 
 
@@ -132,8 +134,8 @@ npm install
 3. 打包
 npm run desktop:build
 产物在 desktop-dist/：
-   晨曦短剧梦工坊-v2.8.7-便携版.exe
-   晨曦短剧梦工坊-安装版-v2.8.7.exe
+   晨曦短剧梦工坊-v2.8.8-便携版.exe
+   晨曦短剧梦工坊-安装版-v2.8.8.exe
 ```
 
 **便携模式资源路径：**
@@ -166,11 +168,12 @@ npm run desktop:build
 ├── server.js                Node 服务器（代理/落盘/作品库/合并接口）
 ├── merge_videos.py          视频合并 + VAD+ASR 字幕烧录核心脚本
 ├── video-poster.js          作品库封面（视频第一帧抽帧 + 缓存）
+├── update-downloader.js     应用内更新下载（进度/重定向/超时/取消 + 安装包校验）
 ├── electron-process-video.js Electron IPC 处理器（便携模式资源定位）
 ├── electron-main.js         Electron 桌面版主进程
 ├── electron-preload.js      Electron 预加载桥
 ├── styles.css               样式
-├── package.json             项目配置（v2.8.7）
+├── package.json             项目配置（v2.8.8）
 ├── latest.json              版本更新清单
 ├── assets/                  图标资源
 ├── output/                  生成结果（不推送, gitignore）
