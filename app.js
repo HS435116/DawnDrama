@@ -16,7 +16,7 @@
  */
 
 // ================= 版本信息 =================
-const APP_VERSION = '2.8.8';
+const APP_VERSION = '2.8.9';
 // 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date"})
 // 发布新版本时的检查清单:
 //   1) bump 本文件的 APP_VERSION、package.json 的 version、server.js 的 APP_VERSION
@@ -2430,6 +2430,13 @@ class AgnesVideoGenerator {
             // 更新页正开着的话, 把"版本信息"区刷新成刚查到的结果
             const page = document.getElementById('update');
             if (page && page.classList.contains('active')) this.renderUpdateInfo();
+            // 手动点"检查更新"发现新版本时, 直接把更新窗口带出来: 用户点这一下就是想知道能不能升级,
+            // 只给一行文字等于让他再找一次入口 (用户反馈过"取消后再点检查更新, 怎么不弹了")。
+            // 点过"稍后"的那个版本仍然不打扰 —— 页面里的"⬇️ 立即更新"随时可点。
+            if (!silent && isNew && info.url && !this._updateDeferred(latest)) {
+                // 触发时再判断一次"稍后": 用户可能就在这一瞬间点了稍后, 不能又把窗口弹回来
+                setTimeout(() => { if (!this._updateDeferred(latest)) this.openUpdateDialog(); }, 120);
+            }
             return info;
         } catch (e) {
             finish('❌ 无法连接更新源 (' + e.message + ')。不影响当前版本使用，可稍后再试或离线使用', 'warning');
@@ -2545,7 +2552,14 @@ class AgnesVideoGenerator {
         const modal = document.getElementById('modal');
         const body = document.getElementById('modal-body');
         if (!modal || !body) return;
+        // 同一次更新可能被反复触发 (手动检查一次 + 进入更新页一次): 已经开着就只把它显示出来,
+        // 不要重画一遍再重启一次下载
+        if (this._updateDialogOpen && this._updateDialogVersion === String(info.version)) {
+            modal.style.display = 'block';
+            return;
+        }
         this._updateDialogOpen = true;
+        this._updateDialogVersion = String(info.version);
         this._updateDownload = null;          // 本次下载结果 {path, bytes, portable}
         this._updateProgress = null;
 
