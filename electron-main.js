@@ -205,13 +205,20 @@ ipcMain.handle('update-install', async (_, payload) => {
     if (!trustedUpdateDirs.has(dir) || !looksLikeInstaller(filePath)) {
         return { ok: false, error: '安装包路径不合法' };
     }
-    const child = spawn(filePath, ['--updated', '--force-run'], {
+    // 参数按 electron-builder 生成向导式安装包的约定:
+    //   /S           静默安装 —— 不弹向导页 (程序内的更新是"点一下就装好", 不该让用户再点一圈)
+    //   --updated    已经知道本程序在跑, 不必弹"请先关闭"的对话框 (它会结束旧进程)
+    //   --force-run  装完自动把应用重新拉起来 (用户看到的就是"更新完自动重启")
+    // 安装目录不额外指定: 安装包会从注册表里读上次的安装位置 (含用户自选的目录),
+    // 因此静默升级始终装回原处, 与"按之前的安装路径"一致。
+    const args = ['/S', '--updated', '--force-run'];
+    const child = spawn(filePath, args, {
         detached: true,
         stdio: 'ignore',
         cwd: dir,
     });
     child.unref();
-    console.log(`[Update] 启动安装包: ${filePath} (--updated --force-run), 本程序即将退出`);
+    console.log(`[Update] 启动安装包: ${filePath} (${args.join(' ')}), 本程序即将退出`);
     // 立刻退出: 安装包随后会结束本进程 (更稳) 或等它自己退出后再覆盖文件
     setTimeout(() => { try { app.quit(); } catch (_) { /* 已退出 */ } }, 800);
     return { ok: true };

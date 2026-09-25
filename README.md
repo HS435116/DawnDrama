@@ -51,6 +51,18 @@ npm run desktop:build
 # 双击即可运行，无需安装 Node.js / Python / FFmpeg
 ```
 
+方式三：桌面安装版（向导式安装，可选安装目录）
+
+```bash
+npm run desktop:build
+# 产物：desktop-dist/晨曦短剧梦工坊-安装版-v<版本>.exe
+```
+
+- 安装过程是向导式：**可以选择安装位置**（默认 `%LOCALAPPDATA%\Programs\agnes-2.5-video-generator`，想装到 D 盘等其它位置直接改）；装完可在完成页直接勾选运行；
+- **覆盖升级不需要手动卸载**：直接运行新版安装包，它会关闭正在运行的旧版，并装回**上次选择的安装目录**；
+- **程序内自动更新同样装回原目录**（静默升级沿用已记录的安装位置）；
+- 作品库、剧本存档、设置都在用户数据目录（`%APPDATA%\agnes-2.5-video-generator`）里，升级/卸载都不删除（配置项 `deleteAppDataOnUninstall: false`）。
+
 
 核心功能
 
@@ -135,8 +147,8 @@ npm install
 3. 打包
 npm run desktop:build
 产物在 desktop-dist/：
-   晨曦短剧梦工坊-v2.8.9-便携版.exe
-   晨曦短剧梦工坊-安装版-v2.8.9.exe
+   晨曦短剧梦工坊-v2.8.10-便携版.exe
+   晨曦短剧梦工坊-安装版-v2.8.10.exe
 ```
 
 **便携模式资源路径：**
@@ -174,7 +186,7 @@ npm run desktop:build
 ├── electron-main.js         Electron 桌面版主进程
 ├── electron-preload.js      Electron 预加载桥
 ├── styles.css               样式
-├── package.json             项目配置（v2.8.9）
+├── package.json             项目配置（v2.8.10）
 ├── latest.json              版本更新清单
 ├── assets/                  图标资源
 ├── output/                  生成结果（不推送, gitignore）

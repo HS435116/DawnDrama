@@ -1,6 +1,6 @@
 {
   "name": "agnes-2.5-video-generator",
-  "version": "2.8.9",
+  "version": "2.8.10",
   "description": "晨曦短剧梦工坊 - 多平台AI短剧批量制作工具",
   "main": "electron-main.js",
   "scripts": {
@@ -123,8 +123,10 @@
       ]
     },
     "nsis": {
-      "oneClick": true,
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
       "perMachine": false,
+      "installerIcon": "assets/logo.ico",
       "artifactName": "晨曦短剧梦工坊-安装版-v${version}.${ext}",
       "deleteAppDataOnUninstall": false
     },
