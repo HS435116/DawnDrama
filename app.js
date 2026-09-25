@@ -2430,12 +2430,10 @@ class AgnesVideoGenerator {
             // 更新页正开着的话, 把"版本信息"区刷新成刚查到的结果
             const page = document.getElementById('update');
             if (page && page.classList.contains('active')) this.renderUpdateInfo();
-            // 手动点"检查更新"发现新版本时, 直接把更新窗口带出来: 用户点这一下就是想知道能不能升级,
-            // 只给一行文字等于让他再找一次入口 (用户反馈过"取消后再点检查更新, 怎么不弹了")。
-            // 点过"稍后"的那个版本仍然不打扰 —— 页面里的"⬇️ 立即更新"随时可点。
-            if (!silent && isNew && info.url && !this._updateDeferred(latest)) {
-                // 触发时再判断一次"稍后": 用户可能就在这一瞬间点了稍后, 不能又把窗口弹回来
-                setTimeout(() => { if (!this._updateDeferred(latest)) this.openUpdateDialog(); }, 120);
+            // 手动点"检查更新"发现新版本时, 直接把更新窗口弹出来: 用户点这一下就是想知道能不能升级,
+            // 只给一行文字等于让他再找一次入口 (用户反馈: 取消后再点检查更新, 必须能再次弹出窗口执行更新)
+            if (!silent && isNew && info.url) {
+                setTimeout(() => this.openUpdateDialog(), 120);
             }
             return info;
         } catch (e) {
@@ -2448,11 +2446,10 @@ class AgnesVideoGenerator {
     showUpdatePage() {
         this.switchTab('update');
         this.renderUpdatePage();
-        // 点进"版本更新"就是奔着更新来的: 有新版本就把下载弹窗一起带出来 (自动开始下载)。
-        // 用户点过"稍后"的那个版本不再自动弹, 页面里的"⬇️ 立即更新"按钮仍可手动触发。
+        // 点进"🔄 版本更新"就是奔着更新来的: 只要有新版本就弹出更新窗口 (不看上次是否点过"稍后",
+        // 用户明确要求"取消后再次点更新/检查更新, 要能再次弹出窗口执行更新")
         const info = this._updateInfo;
-        if (info && info.url && this.compareVersions(String(info.version), APP_VERSION) > 0
-            && !this._updateDeferred(info.version)) {
+        if (info && info.url && this.compareVersions(String(info.version), APP_VERSION) > 0) {
             setTimeout(() => this.openUpdateDialog(), 80);
         }
     }
@@ -2525,15 +2522,6 @@ class AgnesVideoGenerator {
         if (box) box.innerHTML = this.updateInfoHtml();
     }
 
-    /** 这个版本用户是否说过"稍后" (说过就不再自动弹下载窗, 但仍可手动点) */
-    _updateDeferred(version) {
-        try { return localStorage.getItem('agnes_update_later') === String(version); } catch (_) { return false; }
-    }
-
-    _deferUpdate(version) {
-        try { localStorage.setItem('agnes_update_later', String(version)); } catch (_) { /* 隐私模式 */ }
-    }
-
     /** 把"最近 5 条版本记录"填进更新页; 清单还没拉到时会用本地缓存 */
     renderUpdateHistory() {
         const box = document.getElementById('update-history');
@@ -2562,6 +2550,9 @@ class AgnesVideoGenerator {
         this._updateDialogVersion = String(info.version);
         this._updateDownload = null;          // 本次下载结果 {path, bytes, portable}
         this._updateProgress = null;
+        // 这个版本之前已经下好过 (用户点过稍后/关过窗口又进来): 直接用，不再重下几百 MB
+        const ready = this._updateDownloaded && this._updateDownloaded.version === String(info.version)
+            ? this._updateDownloaded.res : null;
 
         const desktop = !!(window.electronAPI && window.electronAPI.updateDownload);
         const isNew = this.compareVersions(String(info.version), APP_VERSION) > 0;
@@ -2619,19 +2610,45 @@ class AgnesVideoGenerator {
         }
         // 桌面端: 打开即自动开始下载 (用户点"版本更新"就是来更新的)
         if (cancelBtn) cancelBtn.style.display = '';
+        if (ready) {
+            // 已经下好过: 直接给安装入口, 不重复下载
+            this._applyDownloadResult(info, ready);
+            return;
+        }
         this.startUpdateDownload(info);
+    }
+
+    /** 下载成功后统一处理: 便携版引导手动运行, 安装版给"立即安装并重启" */
+    _applyDownloadResult(info, res) {
+        this._updateDownload = res;
+        this._updateDownloaded = { version: String(info.version), res };
+        this._renderUpdateProgress({ phase: 'done', percent: 100, received: res.bytes, total: res.bytes, speed: 0 });
+        const installBtn = document.getElementById('update-install-btn');
+        const revealBtn = document.getElementById('update-reveal-btn');
+        if (res.portable) {
+            // 便携版是单文件 exe, 正在运行时没法覆盖自己 —— 下好让用户关掉程序后运行新文件
+            if (installBtn) installBtn.style.display = 'none';
+            this._setUpdateDialogStatus('✅ 已下载完成：' + res.path + '\n便携版无法自动覆盖正在运行的文件：请关闭本程序后双击该文件运行新版本（作品、剧本与设置都在作品库目录里，不受影响）。', 'success');
+            if (revealBtn) revealBtn.style.display = '';
+        } else {
+            this._setUpdateDialogStatus('✅ 下载完成（' + this._formatBytes(res.bytes) + '）。点"🔧 立即安装并重启"完成升级：程序会先退出，安装到原来的安装路径，装完自动打开新版本；作品、剧本存档与设置全部保留。', 'success');
+            if (installBtn) installBtn.style.display = 'block';
+        }
     }
 
     _cachedUpdateInfo() {
         try { return JSON.parse(localStorage.getItem('agnes_update_info') || 'null'); } catch (_) { return null; }
     }
 
+    /**
+     * 用户点了"稍后"/关掉更新窗口: 只收掉窗口并停掉本次下载, 不记"以后别再弹"——
+     * 再次点"🔄 版本更新"或"🔍 检查更新"时照样会弹出来 (用户明确要求可反复触发更新)
+     */
     _onUpdateLater(info) {
-        this._deferUpdate(info && info.version);
         if (window.electronAPI && window.electronAPI.updateCancel) window.electronAPI.updateCancel();
         this._updateDialogOpen = false;
         this.closeModal();
-        this.showStatus('已选择稍后更新。需要时到"🔄 版本更新"页点"⬇️ 立即更新"即可', 'info');
+        this.showStatus('已取消本次更新 (v' + ((info && info.version) || '') + ')。需要时再点"🔄 版本更新"或"🔍 检查更新"即可重新开始', 'info');
     }
 
     _setUpdateDialogStatus(text, type = 'info') {
@@ -2679,24 +2696,12 @@ class AgnesVideoGenerator {
         } catch (e) {
             res = { ok: false, error: e && e.message ? e.message : String(e) };
         }
-        const installBtn = document.getElementById('update-install-btn');
         if (cancelBtn) cancelBtn.style.display = 'none';
         if (!res || !res.ok) {
             this._setUpdateDialogStatus('❌ 下载失败: ' + ((res && res.error) || '未知错误') + '。可稍后重试，或用系统浏览器手动下载。', 'warning');
             return;
         }
-        this._updateDownload = res;
-        this._renderUpdateProgress({ phase: 'done', percent: 100, received: res.bytes, total: res.bytes, speed: 0 });
-        const revealBtn = document.getElementById('update-reveal-btn');
-        if (res.portable) {
-            // 便携版是单文件 exe, 正在运行时没法覆盖自己 —— 下好让用户关掉程序后运行新文件
-            if (installBtn) installBtn.style.display = 'none';
-            this._setUpdateDialogStatus('✅ 已下载完成：' + res.path + '\n便携版无法自动覆盖正在运行的文件：请关闭本程序后双击该文件运行新版本（作品、剧本与设置都在作品库目录里，不受影响）。', 'success');
-            if (revealBtn) revealBtn.style.display = '';
-        } else {
-            this._setUpdateDialogStatus('✅ 下载完成（' + this._formatBytes(res.bytes) + '）。点"🔧 立即安装并重启"完成升级：程序会先退出，安装到原来的安装路径，装完自动打开新版本；作品、剧本存档与设置全部保留。', 'success');
-            if (installBtn) installBtn.style.display = 'block';
-        }
+        this._applyDownloadResult(info, res);
     }
 
     _renderUpdateProgress(p) {
