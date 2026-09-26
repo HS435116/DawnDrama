@@ -33,6 +33,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
             if (stageHandler) ipcRenderer.on('video-merge-stage', stageHandler);
 
             const handler = (_, result) => {
+                // 主进程一开始会推一条 {status:'processing'} 表示"已经开始", 它不是终态。
+                // 以前这里把所有非 completed 的事件都当成失败并立刻 resolve —— 结果是合并刚启动
+                // 就弹"❌ 合并失败", 而后台其实还在正常拼接/烧录、最后也真的成功了 (用户反馈);
+                // 顺带还把 stage 监听摘掉, 整个音频识别与烧录过程一点进度都看不到。
+                if (!result || result.status === 'processing') return;
                 ipcRenderer.removeListener('video-merge-progress', handler);
                 if (stageHandler) ipcRenderer.removeListener('video-merge-stage', stageHandler);
                 if (result.status === 'completed') {
@@ -58,6 +63,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
             if (stageHandler) ipcRenderer.on('video-merge-stage', stageHandler);
 
             const handler = (_, result) => {
+                // 同 mergeEpisode: {status:'processing'} 是"已开始"不是终态, 漏判会让手动合并
+                // 在真正开始之前就报失败, 而且再看不到任何阶段进度
+                if (!result || result.status === 'processing') return;
                 ipcRenderer.removeListener('video-merge-files-progress', handler);
                 if (stageHandler) ipcRenderer.removeListener('video-merge-stage', stageHandler);
                 if (result.status === 'completed') {

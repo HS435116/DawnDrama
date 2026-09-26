@@ -3689,16 +3689,37 @@ class AgnesVideoGenerator {
     }
 
     /** merge_videos.py 阶段 -> 进度百分比 (ASR 阶段按已识别片段数线性推进) */
+    /** 阶段 -> 图标 (生成进度面板与手动合并面板共用; 手动合并那边以前一律显示 🎙️) */
+    _stageIcon(stage) {
+        const icons = {
+            start: '🎬', concat: '🔗', asr: '🎙️', srt: '📄', burn: '🔥',
+            done: '✅', 'burn-failed': '⚠️', 'no-speech': '⚠️', 'asr-unavailable': '⚠️'
+        };
+        return icons[stage] || '⏳';
+    }
+
+    /** 阶段 -> 右侧明细文字 (烧录显示百分比, 识别显示片段数) */
+    _stageDetail(ev) {
+        const total = Number(ev && ev.total) || 0;
+        const cur = Number(ev && ev.current) || 0;
+        if (!total) return '';
+        if (ev.stage === 'burn') return `已烧录 ${Math.min(100, Math.round(cur / total * 100))}%`;
+        if (ev.stage === 'asr') return `已识别 ${cur}/${total} 个片段`;
+        return `已处理 ${cur}/${total}`;
+    }
+
     _postStagePercent(ev) {
         const stage = ev && ev.stage;
-        if (stage === 'asr') {
-            const total = Number(ev.total) || 0;
-            const cur = Number(ev.current) || 0;
-            return total > 0 ? 25 + Math.round(45 * Math.min(1, cur / total)) : 30;
-        }
+        const total = Number(ev && ev.total) || 0;
+        const cur = Number(ev && ev.current) || 0;
+        const inRange = (lo, hi) => lo + Math.round((hi - lo) * Math.min(1, Math.max(0, cur / total)));
+        if (stage === 'asr') return total > 0 ? inRange(25, 70) : 30;
+        // 烧录是最慢的一步 (整条视频重新编码): 给它一段能真正走动的区间,
+        // 否则进度条会一直卡在固定的 85% 上一动不动, 看着就像卡死
+        if (stage === 'burn') return total > 0 ? inRange(78, 96) : 78;
         const table = {
-            start: 6, concat: 15, srt: 72, burn: 85,
-            'burn-failed': 95, 'no-speech': 95, 'asr-unavailable': 95, done: 100
+            start: 6, concat: 15, srt: 74,
+            'burn-failed': 96, 'no-speech': 96, 'asr-unavailable': 96, done: 100
         };
         return Object.prototype.hasOwnProperty.call(table, stage) ? table[stage] : (this._postPercent || 50);
     }
@@ -3706,12 +3727,8 @@ class AgnesVideoGenerator {
     _onPostStage(ev) {
         if (!ev || !ev.stage) return;
         const pct = this._postStagePercent(ev);
-        const icons = {
-            start: '🎬', concat: '🔗', asr: '🎙️', srt: '📄', burn: '🔥',
-            done: '✅', 'burn-failed': '⚠️', 'no-speech': '⚠️', 'asr-unavailable': '⚠️'
-        };
-        const icon = icons[ev.stage] || '⏳';
-        const detail = (ev.current && ev.total) ? `已处理 ${ev.current}/${ev.total}` : '';
+        const icon = this._stageIcon(ev.stage);
+        const detail = this._stageDetail(ev);
         this._setPostProgress(pct, `${icon} ${ev.message || ''}`, detail);
         if (ev.stage === 'done') {
             this.setProgressBar(100, `✅ 后期处理完成 (音频识别 + 中文字幕已烧录)`);
@@ -3980,8 +3997,8 @@ class AgnesVideoGenerator {
         // 实时显示 拼接 -> 音频识别 -> 烧录中文字幕 的阶段进度
         const onStage = (ev) => {
             if (!ev || !ev.stage) return;
-            const detail = (ev.current && ev.total) ? `已处理 ${ev.current}/${ev.total}` : '';
-            this._setMergeProgress(this._postStagePercent(ev), `🎙️ ${ev.message || '处理中'}`, detail);
+            this._setMergeProgress(this._postStagePercent(ev),
+                `${this._stageIcon(ev.stage)} ${ev.message || '处理中'}`, this._stageDetail(ev));
         };
         try {
             let finalPath = null;

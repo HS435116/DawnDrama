@@ -171,6 +171,14 @@ def emit_stage(stage, message, current=None, total=None):
         pass
 
 
+def burn_progress_reporter():
+    """烧录进度 → 阶段事件 (单分镜与多分镜两处共用)。
+    带上的 current/total 是"已烧录秒数 / 视频总秒数", 前端据此画出真实百分比。"""
+    def report(done, total):
+        emit_stage('burn', f'烧录中文字幕中 (字体: {SUB_FONT_NAME})', round(done), round(total))
+    return report
+
+
 # ============ 工具函数 ============
 
 def natural_sort_key(path):
@@ -436,8 +444,13 @@ def fmt_srt(sec):
 
 # ============ 字幕烧录 ============
 
-def burn_subtitles(merged_path, srt_path, output_path):
-    """用 ffmpeg subtitles 滤镜烧录中文字幕"""
+def burn_subtitles(merged_path, srt_path, output_path, on_progress=None):
+    """用 ffmpeg subtitles 滤镜烧录中文字幕。
+
+    on_progress(done_secs, total_secs) 会随 ffmpeg 的输出定期回调 ——
+    烧录是整条链路里最慢的一步 (整条视频要重新编码), 以前只能干等, 界面上停在
+    "烧录中文字幕中" 一动不动, 看着像卡死; 有了它就能显示真实百分比。
+    """
     out_dir = os.path.dirname(os.path.abspath(output_path))
     orig_dir = os.getcwd()
     try:
@@ -456,21 +469,49 @@ def burn_subtitles(merged_path, srt_path, output_path):
         )
 
         tmp_name = '_burn_tmp.mp4'
+        # -progress pipe:1 让 ffmpeg 把机器可读的进度按行吐到 stdout (别的日志仍走 stderr),
+        # 下面合流后按行区分: 进度行只用来算百分比, 不混进报错信息里
         cmd = [
             FFMPEG, '-y',
             '-i', os.path.abspath(merged_path),
             '-vf', f"subtitles='{os.path.basename(srt_path)}':charenc=UTF-8:force_style='{style}'",
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
             '-c:a', 'copy',
+            '-loglevel', 'error', '-nostats', '-progress', 'pipe:1',
             tmp_name,
         ]
         print(f"    ▶ 执行烧录命令...")
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           encoding='utf-8', errors='ignore')
+        total_secs = get_media_duration(merged_path) or 0
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding='utf-8', errors='ignore', bufsize=1)
 
-        if r.returncode != 0:
-            print(f"    ❌ ffmpeg 返回码 {r.returncode}")
-            print(f"    stderr 尾部:\n{(r.stderr or '')[-800:]}")
+        progress_re = re.compile(r'^(out_time_us|out_time_ms|frame|fps|bitrate|total_size|'
+                                 r'dup_frames|drop_frames|speed|progress)=')
+        log_tail = ''
+        last_pct = -1
+        for line in proc.stdout:
+            line = line.rstrip('\n').rstrip('\r')
+            if progress_re.match(line):
+                # 只在整数百分比变化时上报: 几十分钟的烧录否则会刷出几千条事件
+                if on_progress and total_secs > 0 and line.startswith('out_time_'):
+                    try:
+                        done = float(line.split('=', 1)[1]) / 1000000.0
+                    except ValueError:
+                        continue
+                    pct = int(min(99.0, max(0.0, done / total_secs * 100)))
+                    if pct != last_pct:
+                        last_pct = pct
+                        try:
+                            on_progress(done, total_secs)
+                        except Exception:
+                            pass
+                continue
+            log_tail = (log_tail + line + '\n')[-1200:]
+        code = proc.wait()
+
+        if code != 0:
+            print(f"    ❌ ffmpeg 返回码 {code}")
+            print(f"    stderr 尾部:\n{log_tail}")
             return False
 
         if not os.path.exists(tmp_name):
@@ -594,7 +635,7 @@ def process_video_list(video_files, output_dir, final_name, display_name):
             # 单分镜: 不拼接, 但照样把字幕烧进画面 —— 只编码这一次, 输出 <集名>_完整版.mp4
             print(f"\n  🔥 烧录中文字幕中（字体: {SUB_FONT_NAME}, 字号: {SUB_FONT_SIZE}）...")
             emit_stage('burn', f'烧录中文字幕中 (字体: {SUB_FONT_NAME})')
-            if burn_subtitles(video_files[0], srt_out, output_abs):
+            if burn_subtitles(video_files[0], srt_out, output_abs, burn_progress_reporter()):
                 _set_subtitle_status(True)
                 _set_subtitle_path(srt_out)
                 final_dur = get_media_duration(output_abs)
@@ -637,7 +678,7 @@ def process_video_list(video_files, output_dir, final_name, display_name):
         # Step 4: 烧录字幕
         print(f"\n  🔥 烧录中文字幕中（字体: {SUB_FONT_NAME}, 字号: {SUB_FONT_SIZE}）...")
         emit_stage('burn', f'烧录中文字幕中 (字体: {SUB_FONT_NAME})')
-        if burn_subtitles(merged_path, srt_path, output_abs):
+        if burn_subtitles(merged_path, srt_path, output_abs, burn_progress_reporter()):
             final_dur = get_media_duration(output_abs)
             print(f"  ✅ 完成: {final_name}  ({final_dur:.2f}s)")
             _set_subtitle_status(True)
