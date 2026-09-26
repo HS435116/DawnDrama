@@ -1,6 +1,6 @@
 {
   "name": "agnes-2.5-video-generator",
-  "version": "2.8.10",
+  "version": "2.8.11",
   "description": "晨曦短剧梦工坊 - 多平台AI短剧批量制作工具",
   "main": "electron-main.js",
   "scripts": {
@@ -31,7 +31,8 @@
     "package:linux": "pkg . --targets node22-linux-x64 --out-path dist",
     "package:macos": "pkg . --targets node22-macos-arm64 --out-path dist",
     "desktop": "electron .",
-    "desktop:build": "electron-builder --win portable nsis"
+    "desktop:build": "electron-builder --win portable nsis",
+    "stamp": "node stamp-latest.js"
   },
   "keywords": [
     "video",
@@ -78,6 +79,7 @@
   "build": {
     "appId": "studio.morninglight.chenxi-dreamworks",
     "productName": "晨曦短剧梦工坊",
+    "afterAllArtifactBuild": "./build-after.js",
     "directories": {
       "output": "desktop-dist"
     },

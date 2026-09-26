@@ -16,23 +16,34 @@
  */
 
 // ================= 版本信息 =================
-const APP_VERSION = '2.8.10';
-// 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date"})
+const APP_VERSION = '2.8.11';
+// 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date","sha256"})
 // 发布新版本时的检查清单:
-//   1) bump 本文件的 APP_VERSION、package.json 的 version、server.js 的 APP_VERSION
-//   2) 把 latest.json 的 version 改成新版本号, 并在 notes 写更新说明; history 保留最近 5 条
-//      (清单版本必须 > 用户当前版本, 老版本用户才会收到提醒)
-//   3) url 指向安装包、portableUrl 指向便携包 (便携版客户端据此取对应文件);
-//      url 留空表示"暂无下载地址", 界面会引导用户去项目主页
-//   4) 安装包上传到下载站后, 记得把**下载站上的 latest.json 也同步成新版**:
-//      老客户端会优先读站点那份清单, 站点长期不更新 (曾停在 2.8.3) 会让老用户收不到提醒;
-//      v2.8.8 起客户端会继续核对其它更新源并取版本号更高的那份, 但站点仍应保持同步。
+//   1) npm version <新版本> —— 同时改好 package.json 与 package-lock.json
+//   2) 本文件的 APP_VERSION、server.js 的 APP_VERSION、index.html 的 footer-version 跟着改。
+//      版本号一共散在 5 处 (package.json / app.js / server.js / index.html / latest.json),
+//      必须全部一致 —— tests/packaging-merge.test.js 会逐个核对, 漏一处就报错
+//      (历史上漏过: 界面显示 2.8.9 而清单写着 2.8.8)
+//   3) 把这一版的说明写进 release-notes.txt —— 界面上的"本版更新"就是它; 打过包会自动
+//      把上一条挪进 history 并换上新说明 (所以别去手改 latest.json 的 notes, 会串版本)
+//   4) npm run desktop:build —— 打完包 build-after.js 会自动收尾: 算两个包的 SHA256、
+//      写上 url/portableUrl、把上一条挪进 history、校验并补齐下载站 data/ 里的包、
+//      并把清单同步到下载站 data/ 目录。清单和刚打出来的包不可能对不上。
+//      (只打单个目标或想自己收尾: npm run stamp -- --site D:\DawnDrama)
+//   5) 下载站只对外暴露 data/ 目录 (serve.js 会把 /latest.json 和 /data/latest.json 都
+//      映射到 data/latest.json), 所以清单和安装包都必须在 data/ 里; 站点根目录若还留着
+//      一份 latest.json 是不生效的, 发版脚本会提醒移走 —— 两个同名清单最容易发错版本。
+//      站点长期不更新 (曾停在 2.8.3) 会让老用户收不到提醒; 步骤 4 已自动同步。
+//   6) sha256/portableSha256 是完整性校验值 (v2.8.11 起客户端会核对): 别手工改,
+//      一律由脚本按本地刚打出来的包生成 —— 填错会让所有用户的更新直接失败。
 // 更新清单候选地址 (按顺序尝试, 第一个成功的即生效):
 //   1) 自建下载站 —— 国内可达, 与安装包同一域名
+//      注意路径是 /data/latest.json: 下载站的 serve.js 只对外暴露 data 目录
+//      (请求 /latest.json 也会被映射到 data/latest.json, 两个地址等价, 但以 data/ 下的为准)
 //   2) GitHub raw  —— 备用源 (部分网络下不可达, 所以放后面)
 // 只读第一项即可; 任何一项都不可达时静默跳过, 不影响任何功能
 const UPDATE_MANIFEST_URLS = [
-    'http://78oq264463tb.vicp.fun/latest.json',
+    'http://7bdf22eb.r8.cpolar.cn/data/latest.json',
     'https://raw.githubusercontent.com/HS435116/DawnDrama/main/latest.json'
 ];
 const DEFAULT_UPDATE_MANIFEST_URL = UPDATE_MANIFEST_URLS[0];   // 兼容旧引用 (界面默认显示第一个源)
@@ -2398,7 +2409,17 @@ class AgnesVideoGenerator {
             this._manifestUrlUsed = url;
             const latest = String(manifest.version || '').trim();
             if (!latest) throw new Error('清单缺少 version 字段');
-            const info = { version: latest, notes: String(manifest.notes || ''), url: String(manifest.url || ''), date: String(manifest.date || ''), portableUrl: String(manifest.portableUrl || '') };
+            // sha256 / portableSha256 是清单里的可选项: 发布者给了就下载后校验, 没给就只核对体积。
+            // 两个地址各配一个哈希 —— 便携包和安装包内容不同, 用错哈希会把好包判成坏包。
+            const info = {
+                version: latest,
+                notes: String(manifest.notes || ''),
+                url: String(manifest.url || ''),
+                date: String(manifest.date || ''),
+                portableUrl: String(manifest.portableUrl || ''),
+                sha256: String(manifest.sha256 || ''),
+                portableSha256: String(manifest.portableSha256 || ''),
+            };
             this._updateInfo = info;
             // 把清单里的 history (+当前这条) 并进"最近 5 条版本记录", 供版本更新页长期展示 (离线也在)
             this._mergeUpdateHistory(manifest, info);
@@ -2468,7 +2489,7 @@ class AgnesVideoGenerator {
                 '<h3>🔍 检查更新</h3>' +
                 '<div class="form-group">' +
                     '<label for="update-url-input">更新清单地址 (latest.json 格式: version/notes/url)</label>' +
-                    '<input type="text" id="update-url-input" value="' + this.escapeAttr(url) + '" placeholder="https://你的域名/latest.json">' +
+                    '<input type="text" id="update-url-input" value="' + this.escapeAttr(url) + '" placeholder="https://你的域名/data/latest.json">' +
                     '<small>默认会同时检查内置的两个更新源（自建下载站 + 项目仓库），取版本号更高的那份清单；填入自定义地址后只用你填的这一个。留空或不可达时不影响任何功能使用</small>' +
                 '</div>' +
                 '<div class="form-actions" style="border: none; padding-top: 10px;">' +
@@ -2625,15 +2646,27 @@ class AgnesVideoGenerator {
         this._renderUpdateProgress({ phase: 'done', percent: 100, received: res.bytes, total: res.bytes, speed: 0 });
         const installBtn = document.getElementById('update-install-btn');
         const revealBtn = document.getElementById('update-reveal-btn');
+        // 下载明细: 几条线程下的、有没有做完整性校验 —— 出问题时用户能看到依据
+        const detail = this._downloadDetail(res);
         if (res.portable) {
             // 便携版是单文件 exe, 正在运行时没法覆盖自己 —— 下好让用户关掉程序后运行新文件
             if (installBtn) installBtn.style.display = 'none';
-            this._setUpdateDialogStatus('✅ 已下载完成：' + res.path + '\n便携版无法自动覆盖正在运行的文件：请关闭本程序后双击该文件运行新版本（作品、剧本与设置都在作品库目录里，不受影响）。', 'success');
+            this._setUpdateDialogStatus('✅ 已下载完成：' + res.path + detail
+                + '\n便携版无法自动覆盖正在运行的文件：请关闭本程序后双击该文件运行新版本（作品、剧本与设置都在作品库目录里，不受影响）。', 'success');
             if (revealBtn) revealBtn.style.display = '';
         } else {
-            this._setUpdateDialogStatus('✅ 下载完成（' + this._formatBytes(res.bytes) + '）。点"🔧 立即安装并重启"完成升级：程序会先退出，安装到原来的安装路径，装完自动打开新版本；作品、剧本存档与设置全部保留。', 'success');
+            this._setUpdateDialogStatus('✅ 下载完成（' + this._formatBytes(res.bytes) + detail + '）。点"🔧 立即安装并重启"完成升级：程序会先退出，安装到原来的安装路径，装完自动打开新版本；作品、剧本存档与设置全部保留。', 'success');
             if (installBtn) installBtn.style.display = 'block';
         }
+    }
+
+    /** 下载明细文案: 多线程/单线程 + SHA256 校验结果 (清单没给哈希就说"已核对体积") */
+    _downloadDetail(res) {
+        const parts = [];
+        if (res && res.mode === 'multi' && res.threads > 1) parts.push(res.threads + ' 线程加速');
+        if (res && res.verified) parts.push('SHA256 校验通过');
+        else if (res && res.sha256) parts.push('SHA256 ' + String(res.sha256).slice(0, 12) + '…');
+        return parts.length ? '（' + parts.join('，') + '）' : '';
     }
 
     _cachedUpdateInfo() {
@@ -2668,15 +2701,24 @@ class AgnesVideoGenerator {
         return this._runtimeInfo || {};
     }
 
-    /** 桌面端: 便携版取便携包, 安装版取安装包 (便携版没有便携包就退回安装包) */
-    async _updateDownloadUrl(info) {
+    /**
+     * 桌面端: 便携版取便携包, 安装版取安装包 (便携版没有便携包就退回安装包)。
+     * 顺带把该包对应的 sha256 一起取出来 —— 地址和哈希必须成套, 否则会拿着安装包的
+     * 哈希去校验便携包, 好包也会被判成坏的。
+     */
+    async _updateDownloadTarget(info) {
         const rt = await this._runtime();
-        if (rt.portable && info.portableUrl) return info.portableUrl;
-        return info.url || info.portableUrl || '';
+        if (rt.portable && info.portableUrl) {
+            return { url: info.portableUrl, sha256: info.portableSha256 || info.sha256 || '' };
+        }
+        if (info.url) return { url: info.url, sha256: info.sha256 || '' };
+        // 退回便携包 (清单只给了便携地址的情况)
+        return { url: info.portableUrl || '', sha256: info.portableSha256 || info.sha256 || '' };
     }
 
     async startUpdateDownload(info) {
-        const url = await this._updateDownloadUrl(info);
+        const target = await this._updateDownloadTarget(info);
+        const url = target.url;
         if (!url) { this._setUpdateDialogStatus('⚠️ 清单里没有提供下载地址，请前往项目主页手动更新。', 'warning'); return; }
         if (!window.electronAPI || !window.electronAPI.updateDownload) {
             window.open(url, '_blank', 'noopener');
@@ -2692,7 +2734,7 @@ class AgnesVideoGenerator {
         // 下载走主进程 IPC: 出错(或 IPC 本身异常) 也要如实反馈, 绝不能让窗口停在"正在下载"
         let res = null;
         try {
-            res = await window.electronAPI.updateDownload({ url }, (p) => this._renderUpdateProgress(p));
+            res = await window.electronAPI.updateDownload({ url, sha256: target.sha256 }, (p) => this._renderUpdateProgress(p));
         } catch (e) {
             res = { ok: false, error: e && e.message ? e.message : String(e) };
         }
@@ -2713,9 +2755,12 @@ class AgnesVideoGenerator {
         fill.style.width = pct + '%';
         if (p.phase === 'done') { text.textContent = '✅ 下载完成 ' + this._formatBytes(p.received); return; }
         if (p.phase === 'error') { text.textContent = '❌ ' + (p.error || '下载失败'); return; }
+        // 多线程没成、正在改单线程重下: 进度会从 0 开始, 必须说一句, 否则看起来像进度条出错了
+        if (p.phase === 'fallback') { text.textContent = '⚠️ 多线程下载不可用，已自动改用单线程重新下载…'; return; }
         const mb = this._formatBytes(p.received) + (p.total ? ' / ' + this._formatBytes(p.total) : '');
         const speed = p.speed ? ' · ' + this._formatBytes(p.speed) + '/s' : '';
-        text.textContent = (p.total ? pct + '%  ' : '已下载 ') + mb + speed;
+        const threads = p.threads > 1 ? ' · ' + p.threads + ' 线程' : '';
+        text.textContent = (p.total ? pct + '%  ' : '已下载 ') + mb + speed + threads;
     }
 
     _formatBytes(n) {

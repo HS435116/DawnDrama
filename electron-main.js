@@ -16,7 +16,7 @@ const os = require('os');
 const net = require('net');
 const { spawn } = require('child_process');
 const { mergeEpisode, mergeVideoFiles, mergeEpisodesBatch } = require('./electron-process-video');
-const { downloadToFile, fetchJson, fileNameFromUrl, looksLikeInstaller } = require('./update-downloader');
+const { downloadUpdate, fetchJson, fileNameFromUrl, looksLikeInstaller } = require('./update-downloader');
 
 let win = null;
 
@@ -137,11 +137,14 @@ ipcMain.handle('update-fetch-manifest', async (_, url) => {
 /**
  * 下载更新包。安装版落到临时目录; 便携版落到当前 exe 旁边
  * (便携版没法覆盖正在运行的自己, 只能下好让用户关掉程序后双击新文件)。
+ * 下载本身优先走 4 线程分块, 服务器不支持 Range / 分块失败会自动回退单线程重下;
+ * 清单里带了 sha256 就顺带校验, 不符的包直接丢掉, 绝不会拿去安装。
  * 进度通过 update-download-progress 事件推给界面。
  */
 ipcMain.handle('update-download', async (_, payload) => {
     const url = String((payload && payload.url) || '').trim();
     if (!/^https?:\/\//i.test(url)) return { ok: false, error: '下载地址不合法' };
+    const expectedSha256 = String((payload && payload.sha256) || '').trim();
 
     // myTask 必须声明在 try 之外: finally 里要用它比对, 声明在 try 内会变成
     // "myTask is not defined", IPC 直接 reject, 界面就永远停在"正在下载"
@@ -160,12 +163,19 @@ ipcMain.handle('update-download', async (_, payload) => {
         if (updateTask) updateTask.cancelled = true;
         myTask = { cancelled: false, destPath };
         updateTask = myTask;
-        console.log(`[Update] 开始下载更新包: ${url}`);
+        console.log(`[Update] 开始下载更新包: ${url}${expectedSha256 ? ' (带 SHA256 校验)' : ''}`);
         sendToWin('update-download-progress', { phase: 'start', percent: 0, received: 0, total: null, speed: 0 });
 
-        const res = await downloadToFile(url, destPath, {
+        const res = await downloadUpdate(url, destPath, {
             onProgress: (p) => { if (!myTask.cancelled) sendToWin('update-download-progress', { phase: 'progress', ...p }); },
+            // 分块没成功、正在改单线程重下: 如实告诉界面, 别让用户看着进度条归零一头雾水
+            onFallback: (e) => {
+                if (myTask.cancelled) return;
+                console.log(`[Update] 多线程下载不可用, 回退单线程: ${e.message}`);
+                sendToWin('update-download-progress', { phase: 'fallback', percent: 0, received: 0, total: null, speed: 0, error: e.message });
+            },
             isCancelled: () => myTask.cancelled,
+            expectedSha256,
         });
 
         if (!looksLikeInstaller(res.path)) {
@@ -174,9 +184,13 @@ ipcMain.handle('update-download', async (_, payload) => {
             sendToWin('update-download-progress', { phase: 'error', error: '下载到的文件不像安装包' });
             return { ok: false, error: '下载到的文件不像安装包，请改从项目主页手动下载' };
         }
-        console.log(`[Update] 下载完成: ${res.path} (${res.bytes} 字节)`);
+        console.log(`[Update] 下载完成: ${res.path} (${res.bytes} 字节, ${res.mode === 'multi' ? res.threads + ' 线程' : '单线程'}, sha256=${res.sha256})`);
         sendToWin('update-download-progress', { phase: 'done', percent: 100, received: res.bytes, total: res.bytes, speed: 0 });
-        return { ok: true, path: res.path, bytes: res.bytes, portable: IS_PORTABLE, installDir: path.dirname(app.getPath('exe')) };
+        return {
+            ok: true, path: res.path, bytes: res.bytes, sha256: res.sha256,
+            threads: res.threads, mode: res.mode, verified: !!expectedSha256,
+            portable: IS_PORTABLE, installDir: path.dirname(app.getPath('exe')),
+        };
     } catch (e) {
         console.error(`[Update] 下载失败: ${e.message}`);
         sendToWin('update-download-progress', { phase: 'error', error: e.message });

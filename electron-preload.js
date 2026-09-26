@@ -123,10 +123,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     updateFetchManifest: (url) => ipcRenderer.invoke('update-fetch-manifest', url),
 
     /**
-     * 下载更新包, 进度通过 onProgress 回调陆续给出 (主进程已节流)
-     * @param {{url: string}} payload
-     * @param {(p: {phase: string, percent: number|null, received: number, total: number|null, speed: number, error?: string}) => void} [onProgress]
-     * @returns {Promise<{ok: boolean, path?: string, bytes?: number, portable?: boolean, installDir?: string, error?: string}>}
+     * 下载更新包, 进度通过 onProgress 回调陆续给出 (主进程已节流)。
+     * 主进程内部优先走 4 线程分块下载, 服务器不支持 Range 或分块失败会自动回退单线程;
+     * 真的发生回退时会推一次 phase:'fallback' (界面可提示"已改用单线程重试"),
+     * 用户主动取消则不会走回退 (否则"取消"看起来像失灵)。
+     * @param {{url: string, sha256?: string}} payload sha256 取更新清单里的值, 给了就会校验
+     * @param {(p: {phase: string, percent: number|null, received: number, total: number|null, speed: number, threads?: number, error?: string}) => void} [onProgress]
+     * @returns {Promise<{ok: boolean, path?: string, bytes?: number, sha256?: string, threads?: number, mode?: string, verified?: boolean, portable?: boolean, installDir?: string, error?: string}>}
      */
     updateDownload: (payload, onProgress) => {
         const handler = onProgress ? (_, p) => onProgress(p) : null;
