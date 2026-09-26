@@ -75,6 +75,7 @@ class AgnesVideoGenerator {
         this._renderTimer = null;
         this._activeJobs = new Set(); // 正在提交/监控中的记录ID, 防止重复操作
         this._finalizing = new Set(); // 正在保存落盘中的记录ID, 防止重复下载
+        this._recovering = new Set(); // 正在"本地文件丢失 → 重新取回"中的记录ID, 防止重复触发
         this._unfinishedSig = null;   // "未完成任务"面板的内容指纹 (避免无谓重绘)
         this._unfinishedHidden = false;
         this._scriptGenerated = false; // 剧本是否已生成待确认
@@ -3076,6 +3077,98 @@ class AgnesVideoGenerator {
 
     /* ================= 预览 / 下载 / 删除 ================= */
 
+    /** 预览里播放本地文件用的地址 (只有"服务器/桌面模式 + 记录里有本地路径"时才有) */
+    _localVideoSrc(item) {
+        return (item && item.path && this.serverMode)
+            ? '/api/download-file?path=' + this._encodeLibraryPath(item.path)
+            : '';
+    }
+
+    /** 下载按钮用的本地文件地址 (走 /api/download/<类型>/<标题>/<文件>, 交给浏览器另存为) */
+    _localDownloadUrl(item) {
+        if (!item || !item.path) return '';
+        const [type, title, filename] = this.splitLocalPath(item.path);
+        return `/api/download/${encodeURIComponent(type)}/${encodeURIComponent(title)}/${encodeURIComponent(filename)}`;
+    }
+
+    /**
+     * 本地文件是不是真的没了 —— 只有在服务器明确回 404 时才判"没了"。
+     * 探不出来 (服务器没起来 / 网络抖动 / 别的状态码) 一律按"还在"处理: 宁可维持原样,
+     * 也不能因为一次探测失败就把好端端的本地文件当丢失的重新下一遍。
+     * 用 HEAD 只取响应头, 不会真把视频拉下来; 也比 window.open 强 —— 后者遇到 404
+     * 只会给用户甩一页 JSON, 代码还拦不住。
+     */
+    async _localFileGone(url) {
+        if (!url || !this.serverMode) return false;
+        try {
+            const r = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+            return r.status === 404;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    /**
+     * 本地文件丢了就自动把源视频重新取回来 (用户明确要求的行为):
+     * 他临时删掉本地视频后, 点预览/下载应当自动从平台下一份再继续, 而不是报错。
+     * @param {(text:string)=>void} [onProgress] 取回过程中的文字反馈
+     * @returns {Promise<'recovered'|'failed'|'busy'|'unavailable'>}
+     */
+    async _recoverMissingLocal(item, onProgress) {
+        const say = (text) => { if (typeof onProgress === 'function') onProgress(text); };
+        if (!this.serverMode || !item) return 'failed';
+        if (!item.url) {
+            say('❌ 本地文件已丢失，这条记录又没有平台地址，无法自动取回');
+            return 'unavailable';
+        }
+        // 预览的预检与播放器的 error 事件可能同一瞬间都触发, 只认第一次
+        if (this._recovering.has(item.id)) return 'busy';
+        this._recovering.add(item.id);
+        try {
+            say('⬇️ 本地文件已丢失，正在从平台重新下载…');
+            this.showStatus(`📥 本地文件已丢失，正在重新下载: ${item.title}`, 'info');
+            // 必须先清掉 path: 保存流程靠"记录里有没有 path"决定要不要落盘,
+            // 不清掉就会被当成"已经保存过"直接跳过 —— 这正是以前只会报错、不会自动取回的原因
+            item.path = '';
+            item.saveError = null;
+            await this.finalizeRecord(item, item.url);
+            if (item.path) {
+                say('✅ 已重新下载，正在播放…');
+                this.showStatus(`✅ 已重新下载: ${item.title}`, 'success');
+                return 'recovered';
+            }
+            const why = item.saveError || '平台链接可能已过期';
+            say(`❌ 重新下载失败: ${why}`);
+            this.showStatus(`❌ 重新下载失败: ${why}`, 'error');
+            return 'failed';
+        } finally {
+            this._recovering.delete(item.id);
+        }
+    }
+
+    /**
+     * 预览打开时先探一次本地文件: 确定没了就自动取回, 取回后无缝切回本地文件播放。
+     * 不用等播放器报错 —— 那样用户会先看到一个坏掉的播放器和一句"无法播放"。
+     * 文件还在时什么都不做 (探测这一步同时挡住了"每次预览都把好文件重下一遍"的风险)。
+     * @returns {Promise<'intact'|'recovered'|'failed'|'busy'|'unavailable'>}
+     */
+    async _relinkPreviewVideo(item) {
+        if (!await this._localFileGone(this._localVideoSrc(item))) return 'intact';
+        const r = await this._recoverMissingLocal(item, (text) => {
+            const tip = document.getElementById('preview-video-error');
+            if (tip) { tip.textContent = text; tip.style.display = 'block'; }
+        });
+        if (r !== 'recovered') return r;   // busy/failed/unavailable 都不用动播放器
+        const el = document.getElementById('preview-video');
+        const fresh = this._localVideoSrc(item);
+        if (!el || !fresh) return r;
+        // 地址没变, 加个时间戳绕开浏览器对上一次 404 的缓存
+        el.src = fresh + (fresh.includes('?') ? '&' : '?') + '_=' + Date.now();
+        try { el.load(); } catch (_) { /* 忽略: 有的环境没有 load */ }
+        try { if (el.play) el.play(); } catch (_) { /* 浏览器可能要求用户手势, 那就让他自己点播放 */ }
+        return r;
+    }
+
     previewItem(id) {
         const item = this.history.find(h => h.id === id);
         if (!item) return;
@@ -3085,10 +3178,8 @@ class AgnesVideoGenerator {
         const status = this.normalizeLegacyStatus(item.status);
         const isPending = this.isPendingStatus(status);
         const isDone = status === 'completed';
-        // 播放源优先级: 本地已下载文件 (无需鉴权) > 平台在线地址
-        const localSrc = (item.path && this.serverMode)
-            ? '/api/download-file?path=' + this._encodeLibraryPath(item.path)
-            : '';
+        // 播放源优先级: 本地已下载文件 (无需鉴权, 也不用再走平台) > 平台在线地址
+        const localSrc = this._localVideoSrc(item);
         const playableSrc = localSrc || item.url || '';
         // 已完成但本地未保存成功 (仅服务器模式可重新下载)
         const completedNoLocal = isDone && this.serverMode && !item.path && !!item.url;
@@ -3107,7 +3198,7 @@ class AgnesVideoGenerator {
                 <div class="video-container">
                     <video id="preview-video" controls preload="metadata" playsinline style="width:100%; border-radius:8px; background:#000;" src="${this.escapeAttr(playableSrc)}"></video>
                     <p id="preview-video-error" style="display:none; color: var(--warning-color); font-size: 0.85rem; margin-top: 6px;">
-                        ⚠️ 视频无法播放: 本地文件可能已被移动或删除，可点击下方"重新下载"重新取回。
+                        ⚠️ 本地文件可能已被移动或删除，正在尝试从平台重新取回…
                     </p>
                 </div>
                 <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 6px;">
@@ -3159,13 +3250,18 @@ class AgnesVideoGenerator {
         `;
         modal.style.display = 'block';
 
-        // 本地文件可能已被移动/删除 -> 播放失败时给出可操作的提示
-        const videoEl = document.getElementById('preview-video');
-        if (videoEl) {
-            videoEl.addEventListener('error', () => {
-                const tip = document.getElementById('preview-video-error');
-                if (tip) tip.style.display = 'block';
-            });
+        // 本地文件可能已被移动/删除: 打开时先探一次, 确定没了就自动从平台重新下一份再接着播;
+        // 播放器万一还是报错 (探测结论不可靠/文件损坏), error 事件里再兜一次, 不让用户看到死路
+        if (localSrc) {
+            this._relinkPreviewVideo(item);
+            const videoEl = document.getElementById('preview-video');
+            if (videoEl) {
+                videoEl.addEventListener('error', () => {
+                    const tip = document.getElementById('preview-video-error');
+                    if (tip) tip.style.display = 'block';
+                    this._relinkPreviewVideo(item);
+                });
+            }
         }
 
         if (isPending) {
@@ -3211,16 +3307,42 @@ class AgnesVideoGenerator {
         if (this._attention) this._dismissAttention();
     }
 
+    /**
+     * 触发浏览器"另存为"。用临时 <a> 点击, 而不是 window.open:
+     * 这条路径前面可能刚等过一次很耗时的"重新下载", 用户手势早就过期, window.open 会被拦。
+     * 文件名由服务端的 Content-Disposition 决定 (res.download 会带)。
+     */
+    _triggerBrowserDownload(url) {
+        const a = document.createElement('a');
+        a.href = url;
+        a.rel = 'noopener';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+    }
+
     async downloadItem(id) {
         const item = this.history.find(h => h.id === id);
         if (!item) return;
         if (this.isPendingStatus(this.normalizeLegacyStatus(item.status))) return;
 
         try {
-            // 优先从本地 output 目录下载 (服务器模式)
+            // 优先从本地 output 目录下载 (服务器模式): 本地已有文件就直接给, 不用再跑一趟平台
             if (item.path && this.serverMode) {
-                const [type, title, filename] = this.splitLocalPath(item.path);
-                window.open(`/api/download/${type}/${encodeURIComponent(title)}/${encodeURIComponent(filename)}`, '_blank');
+                const localUrl = this._localDownloadUrl(item);
+                // 用户可能把本地文件删了/移走了: 确定没了就先用平台地址把源视频取回来再给。
+                // 以前这里直接打开地址, 用户只会拿到一页 JSON 404, 看着就像"下载坏了"
+                if (await this._localFileGone(localUrl)) {
+                    const r = await this._recoverMissingLocal(item);
+                    if (r !== 'recovered') {
+                        this.showStatus(r === 'unavailable'
+                            ? '❌ 本地文件已丢失，且这条记录没有平台地址，无法自动取回（请到生成平台手动下载）'
+                            : `❌ 本地文件已丢失，重新下载失败: ${item.saveError || '平台链接可能已过期'}`, 'error');
+                        return;
+                    }
+                }
+                // 取回后路径可能变了, 重新算一次地址
+                this._triggerBrowserDownload(this._localDownloadUrl(item) || localUrl);
                 return;
             }
             if (item.url) {
