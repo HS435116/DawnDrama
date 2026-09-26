@@ -43,7 +43,7 @@ const APP_VERSION = '2.8.12';
 //   2) GitHub raw  —— 备用源 (部分网络下不可达, 所以放后面)
 // 只读第一项即可; 任何一项都不可达时静默跳过, 不影响任何功能
 const UPDATE_MANIFEST_URLS = [
-    'http://7bdf22eb.r8.cpolar.cn/data/latest.json',
+    'http://29b7a853.r21.cpolar.top/data/latest.json',
     'https://raw.githubusercontent.com/HS435116/DawnDrama/main/latest.json'
 ];
 const DEFAULT_UPDATE_MANIFEST_URL = UPDATE_MANIFEST_URLS[0];   // 兼容旧引用 (界面默认显示第一个源)

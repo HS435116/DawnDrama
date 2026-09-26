@@ -76,7 +76,7 @@ function resolvePrefix(manifest, override) {
     if (manifest.url) {
         try { const u = new URL(manifest.url); return u.origin + u.pathname.replace(/[^/]*$/, ''); } catch (_) { /* 清单里的地址坏了, 用默认 */ }
     }
-    return 'http://7bdf22eb.r8.cpolar.cn/data/';
+    return 'http://29b7a853.r21.cpolar.top/data/';
 }
 
 /**

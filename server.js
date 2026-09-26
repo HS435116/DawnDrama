@@ -217,7 +217,7 @@ function reportEvent(name) {
         const payload = { name, data: { uid: _userId, version: APP_VERSION, os: process.platform, browser: 'Electron' } };
         if (_clientIp) payload.data.ip = _clientIp;   // 有就带上, 没有也不阻断上报
         const body = JSON.stringify(payload);
-        const url = new URL('http://7bdf22eb.r8.cpolar.cn/api/collect');
+        const url = new URL('http://29b7a853.r21.cpolar.top/api/collect');
         const opts = { method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }, timeout: 3000 };
         const req = require('http').request(url, opts, res => res.resume());
         req.on('error', () => {});
