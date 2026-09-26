@@ -16,7 +16,7 @@
  */
 
 // ================= 版本信息 =================
-const APP_VERSION = '2.8.11';
+const APP_VERSION = '2.8.12';
 // 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date","sha256"})
 // 发布新版本时的检查清单:
 //   1) npm version <新版本> —— 同时改好 package.json 与 package-lock.json
@@ -3866,15 +3866,39 @@ class AgnesVideoGenerator {
 
         if (files.length < 2) return this.showStatus('⚠️ 至少需要选择 2 个视频文件才能合并', 'warning');
 
-        // 默认输出: 与第一个视频同目录, 名称取其文件名主干
+        // 默认输出: 与第一个视频同目录, 名称与自动合并保持一致 (见 _defaultMergeName)
         const first = files[0];
         const lastSlash = Math.max(first.lastIndexOf('/'), first.lastIndexOf('\\'));
         const defaultDir = lastSlash > 0 ? first.slice(0, lastSlash) : '';
-        const stem = first.slice(lastSlash + 1).replace(/\.[^.]+$/, '') || '合并视频';
+        this._mergeCtx = { files: files.slice(), outName: this._defaultMergeName(files), outDir: defaultDir };
+        this._showMergeDialog();
+    }
+
+    /**
+     * 手动合并的默认成片名 —— 与自动合并同格式 (<剧集标题>_完整版.mp4)。
+     *
+     * 作品库布局是 <输出目录>/video/<剧集标题>/video_1_xxx.mp4, 所以"片段所在的文件夹名"
+     * 就是剧集标题: 手动合并一整集的分镜时, 产物默认就叫 <剧集标题>_完整版.mp4,
+     * 和自动合并出来的完全同名。以前这里取的是第一个片段的文件名, 于是出来一串
+     * video_1_1790309439674_926_1916_完整版 —— 和自动合并对不上, 用户反馈过。
+     *
+     * 片段不在同一个文件夹、或文件夹只是 video/images 这种分类目录时, 退回
+     * "第一个文件名 + 时间戳": 那种场合重名概率高, 加时间戳免得悄悄覆盖掉别的文件。
+     */
+    _defaultMergeName(files) {
+        const cut = (p) => Math.max(String(p).lastIndexOf('/'), String(p).lastIndexOf('\\'));
+        const dirOf = (p) => { const s = cut(p); return s > 0 ? String(p).slice(0, s) : ''; };
+        const stemOf = (p) => { const s = cut(p); return String(p).slice(s + 1).replace(/\.[^.]+$/, ''); };
+        const dirs = new Set(files.map(dirOf));
+        if (dirs.size === 1) {
+            const dir = dirOf(files[0]).replace(/[\\/]+$/, '');
+            const c = Math.max(dir.lastIndexOf('/'), dir.lastIndexOf('\\'));
+            const folder = dir.slice(c + 1);
+            if (folder && !/^(video|images)$/i.test(folder)) return folder;
+        }
         const ts = new Date();
         const stamp = `${ts.getMonth() + 1}${String(ts.getDate()).padStart(2, '0')}_${String(ts.getHours()).padStart(2, '0')}${String(ts.getMinutes()).padStart(2, '0')}`;
-        this._mergeCtx = { files: files.slice(), outName: `${stem}_${stamp}`, outDir: defaultDir };
-        this._showMergeDialog();
+        return `${stemOf(files[0]) || '合并视频'}_${stamp}`;
     }
 
     /** 服务器模式: 弹窗让用户逐行输入服务器本机的视频文件绝对路径 */
