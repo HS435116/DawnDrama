@@ -67,8 +67,8 @@
                             <textarea id="prompt" rows="4" placeholder="描述想要的画面、镜头运动、光影氛围...（点击「开始批量生成」后将按此主提示词自动生成分镜场景）"></textarea>
                             <div class="prompt-split-row">
                                 <label for="prompt-scene-count">🧩 自动拆分分镜数</label>
-                                <input type="number" id="prompt-scene-count" value="4" min="1" max="12">
-                                <small>由「剧本AI」文本模型把主提示词扩写成连续分镜；填 1 表示整段主提示词作为单个分镜。未配置文本模型时改为按行拆分，仅一行则输出单个分镜</small>
+                                <input type="number" id="prompt-scene-count" value="12" min="1" max="200">
+                                <small>由「剧本AI」文本模型按主提示词扩写成连续分镜（以它为主导：情节点多就多分几个，少就少分几个）；填 1 表示整段主提示词作为单个分镜。未配置文本模型时改为按行拆分，仅一行则输出单个分镜</small>
                             </div>
                         </div>
 
@@ -202,7 +202,8 @@
                             </div>
                             <div class="form-group">
                                 <label for="series-ep-count">🔢 每集分镜数</label>
-                                <input type="number" id="series-ep-count" value="4" min="1" max="12">
+                                <input type="number" id="series-ep-count" value="12" min="1" max="200">
+                                <small>按剧情自定义（默认 12）：编剧AI 以此为基准，提示词里情节点多就多分几个、情节简单就少分几个。上限 200 只是防止手滑一次排队太多付费生成</small>
                             </div>
                             <div class="form-group">
                                 <label for="series-total-episodes">🎞️ 总集数</label>
@@ -530,7 +531,7 @@
         <footer class="footer">
             <p>晨曦短剧梦工坊 | 多平台批量视频制作工具</p>
             <p id="connection-status">状态: 检测中...</p>
-           <p><a href="javascript:void(0)" onclick="showVersionInfo()" title="点击查看本版本功能介绍" style="color: var(--primary-color); font-weight: 600;">v<span id="footer-version">2.8.13</span></a> · 2026  晨曦微光工作室 </p>
+           <p><a href="javascript:void(0)" onclick="showVersionInfo()" title="点击查看本版本功能介绍" style="color: var(--primary-color); font-weight: 600;">v<span id="footer-version">2.8.14</span></a> · 2026  晨曦微光工作室 </p>
         </footer>
     </div>
 

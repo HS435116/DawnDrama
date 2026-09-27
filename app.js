@@ -22,8 +22,15 @@
 const RL_MAX_WAIT_MS = 30 * 60 * 1000;   // 单个任务最多等多久 (超过则判失败并说明原因, 不无限等)
 const RL_MAX_DEFERRALS = 3;              // 同一任务最多自动延后几次 (每次都要先等冷却+同伴跑完)
 
+// ================= 每集分镜数 (自定义) =================
+// 分镜数由用户按剧情自己定: 提示词信息量大、情节需要铺开就多分几个, 单薄就少分几个。
+// 不再固定 12; 上限只作"防手滑"的安全阀 —— 一次误输入几千, 程序就会往平台排队提交
+// 几千次付费生成, 所以留一个慷慨的上限, 而不是完全不限。
+const SCENE_COUNT_DEFAULT = 12;
+const SCENE_COUNT_MAX = 200;
+
 // ================= 版本信息 =================
-const APP_VERSION = '2.8.13';
+const APP_VERSION = '2.8.14';
 // 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date","sha256"})
 // 发布新版本时的检查清单:
 //   1) npm version <新版本> —— 同时改好 package.json 与 package-lock.json
@@ -463,11 +470,11 @@ class AgnesVideoGenerator {
         await this.runGeneration(config, jobs, config.title, { forcePostProcess: true, awaitPostProcess: true });
     }
 
-    /** 主提示词自动拆分分镜数 (1~12) */
+    /** 主提示词自动拆分分镜数 (自定义, 默认 12; 上限只防手滑) */
     getPromptSceneCount() {
         const el = document.getElementById('prompt-scene-count');
         const n = parseInt(el && el.value);
-        return Math.max(1, Math.min(12, Number.isFinite(n) ? n : 4));
+        return Math.max(1, Math.min(SCENE_COUNT_MAX, Number.isFinite(n) ? n : SCENE_COUNT_DEFAULT));
     }
 
     /**
@@ -550,16 +557,18 @@ class AgnesVideoGenerator {
         const ratio = document.getElementById('ratio')?.value || '16:9';
         const duration = parseInt(document.getElementById('duration')?.value) || 5;
         const obj = await this.seriesChat(
-`请把下面这段主提示词扩展为恰好 ${count} 个连续分镜，用于AI文生视频批量生成。
+`请以下面这段主提示词为主导，扩展为约 ${count} 个连续分镜，用于AI文生视频批量生成。
+分镜数看提示词里的情节：情节点多、需要铺开就多分几个，情节简单就少分几个（一般不要偏离 ${count} 超过三分之一）。
 
 主提示词：${mainPrompt}
 
 要求：
-1. 每个分镜的 prompt 是可直接用于文生视频的独立完整描述（视频模型看不到其它分镜），必须包含：景别与机位、主体动作与表情、本分镜的情节推进、光影氛围；
-2. 画面比例统一为 ${ratio}，并写在每个分镜 prompt 的开头；
-3. 各分镜按时间顺序连贯衔接，合起来完整呈现主提示词的意图；
-4. 画面全程禁止字幕、对话框、水印、UI文字；
-5. 每个 scene 的 duration 必须严格等于 ${duration}（秒），禁止输出其它数值。
+1. 全部内容用中文：分镜名、分镜提示词、对白与音效描述都写中文，除画面比例这类参数外不要出现英文单词；
+2. 每个分镜的 prompt 是可直接用于文生视频的独立完整描述（视频模型看不到其它分镜），必须包含：景别与机位、主体动作与表情、本分镜的情节推进、光影氛围；
+3. 画面比例统一为 ${ratio}，并写在每个分镜 prompt 的开头；
+4. 各分镜按时间顺序连贯衔接，合起来完整呈现主提示词的意图；
+5. 画面全程禁止字幕、对话框、水印、UI文字；
+6. 每个 scene 的 duration 必须严格等于 ${duration}（秒），禁止输出其它数值。
 只输出JSON：{"scenes":[{"title":"分镜名","prompt":"完整分镜提示词","duration":${duration}}]}`);
         if (!obj || !Array.isArray(obj.scenes)) return [];
         return obj.scenes
@@ -4684,7 +4693,7 @@ class AgnesVideoGenerator {
             characters: [],      // [{name, look, voice, outfit, tagline}]
             nextEpisode: 1,
             season: 1,           // 季数: 导入存档续季时 +1, 用于人物一致性延续
-            scenesPerEpisode: 4,
+            scenesPerEpisode: SCENE_COUNT_DEFAULT,
             totalEpisodes: 10,
             sceneDuration: 5,
             resolution: '720p',
@@ -4856,7 +4865,7 @@ class AgnesVideoGenerator {
             s.title = (g('series-title') || '').trim();
             s.genre = g('series-genre') || s.genre;
             s.premise = (g('series-premise') || '').trim();
-            s.scenesPerEpisode = Math.max(1, Math.min(12, parseInt(g('series-ep-count')) || 4));
+            s.scenesPerEpisode = Math.max(1, Math.min(SCENE_COUNT_MAX, parseInt(g('series-ep-count')) || SCENE_COUNT_DEFAULT));
             s.totalEpisodes = Math.max(1, Math.min(100, parseInt(g('series-total-episodes')) || 10));
             s.sceneDuration = Math.max(1, Math.min(60, parseInt(g('series-scene-duration')) || s.sceneDuration));
             if (g('series-resolution')) s.resolution = g('series-resolution');
@@ -5092,13 +5101,14 @@ ${previous}${lastCliff}
 基于本集剧情发展，用 200~400 字精炼更新「世界观与主线」，覆盖本季核心矛盾、角色状态变化。直接输出纯文本，不要 JSON。
 
 【任务二：编写本集分镜】
-请编写第 ${ep} 集，拆分为恰好 ${s.scenesPerEpisode} 个连续分镜。要求：
-1. 每个分镜 prompt 是可直接用于文生视频的独立完整描述（模型看不到其它分镜），必须包含：景别与机位、人物动作与表情、本分镜情节点、光影氛围、声音（对白用中文引号「」+ 音效描述）；prompt 中禁止出现英文双引号 "；
-2. 全剧画面规格统一：比例 ${s.ratio}、分辨率 ${s.resolution}，请把画面比例写在每个分镜 prompt 开头；
-3. 涉及人物时逐字复用设定卡的 look/voice/outfit 描述，确保人物面孔与声音在所有分镜中一致；
-4. 画面全程禁止字幕、对话框、水印、UI文字；
-5. 每个 scene 的 duration 必须严格等于 ${s.sceneDuration}（秒），全部分镜统一使用该时长，禁止输出其它数值；
-6. 剧情承上启下，结尾留悬念。
+请编写第 ${ep} 集。本集分几个分镜以上面的世界观与主线提示词为主导来决定（见下面第 1 条）。要求：
+1. 分镜数按剧情来分：以 ${s.scenesPerEpisode} 个为基准，提示词里的情节点多、需要铺开就多分几个，情节简单就少分几个（一般不要偏离基准超过三分之一）。判断标准是"每个情节点都值得一个独立画面"，不要为了凑数把同一个情节硬拆成多个分镜；
+2. 全部内容用中文：场景名、分镜提示词、对白与音效描述都写中文，除画面比例/分辨率这类参数外不要出现英文单词；每个分镜 prompt 是可直接用于文生视频的独立完整描述（模型看不到其它分镜），必须包含：景别与机位、人物动作与表情、本分镜情节点、光影氛围、声音（对白用中文引号「」+ 音效描述）；prompt 中禁止出现英文双引号 "；
+3. 全剧画面规格统一：比例 ${s.ratio}、分辨率 ${s.resolution}，请把画面比例写在每个分镜 prompt 开头；
+4. 涉及人物时逐字复用设定卡的 look/voice/outfit 描述，确保人物面孔与声音在所有分镜中一致；
+5. 画面全程禁止字幕、对话框、水印、UI文字；
+6. 每个 scene 的 duration 必须严格等于 ${s.sceneDuration}（秒），全部分镜统一使用该时长，禁止输出其它数值；
+7. 剧情承上启下，结尾留悬念。
 只输出JSON：{"updatedPremise":"精炼后的世界观与主线(200-400字)","synopsis":"本集大纲(80字内)","cliffhanger":"下集悬念(30字内)","scenes":[{"title":"场景名","prompt":"完整分镜提示词","duration":${s.sceneDuration}}]}`);
             if (!obj.scenes || !Array.isArray(obj.scenes) || obj.scenes.length === 0) {
                 throw new Error('剧本AI未返回分镜列表 (可能输出被截断，请重试一次，或在剧集设定中减少每集分镜数)');
@@ -5107,7 +5117,9 @@ ${previous}${lastCliff}
             if (obj.updatedPremise) {
                 s.premise = obj.updatedPremise.trim();
             }
-            const truncated = obj.scenes.length < s.scenesPerEpisode;
+            // 分镜数是"以剧情为主导、以设定值为基准"的, 少一两个属正常 (剧情就那么多情节点);
+            // 只有明显偏少 (不足基准的六成) 才提示可能被截断, 免得把正常结果误报成故障
+            const truncated = obj.scenes.length < Math.max(1, Math.ceil(s.scenesPerEpisode * 0.6));
             s.currentScenes = obj.scenes
                 .map((sc, i) => ({
                     title: sc.title || `场景${i + 1}`,
@@ -5133,7 +5145,10 @@ ${previous}${lastCliff}
             this.renderSeriesUI();
             this._scriptGenerated = true;
             this._updateConfirmBtn();
-            const truncNote = truncated ? ' ⚠️ 检测到剧本输出被截断，已自动修复并保留完整分镜；如缺场景可重新生成本集' : '';
+            const truncNote = truncated
+                ? ` ⚠️ 本集只分出 ${s.currentScenes.length} 个分镜 (基准 ${s.scenesPerEpisode} 个)，可能是剧本输出被截断；`
+                    + '如缺场景可重新生成本集，或把"每集分镜数"调小一些'
+                : '';
             this.setSeriesStatus(`✅ 第 ${ep} 集剧本完成！世界观已更新，共 ${s.currentScenes.length} 个分镜，请确认后启动生成${truncNote}`, truncated ? 'warning' : 'success');
             return true;
         } catch (e) {
