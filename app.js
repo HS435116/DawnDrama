@@ -15,8 +15,15 @@
  *  6. 服务器模式自动检测, 所有平台请求经 /api/proxy 绕过 CORS
  */
 
+// ================= 限流延后提交 (挂机托管无人值守) =================
+// 撞上平台限流时, 以前是把任务直接判失败, 提示"稍后手动点重试" ——
+// 挂机托管时用户不在电脑前, 没人点, 这条任务就永久停在那里 (界面上就是"因限流保护未提交")。
+// 现在改为自动延后: 等其他任务跑完 + 等全局限流冷却结束, 再自动重新提交。
+const RL_MAX_WAIT_MS = 30 * 60 * 1000;   // 单个任务最多等多久 (超过则判失败并说明原因, 不无限等)
+const RL_MAX_DEFERRALS = 3;              // 同一任务最多自动延后几次 (每次都要先等冷却+同伴跑完)
+
 // ================= 版本信息 =================
-const APP_VERSION = '2.8.12';
+const APP_VERSION = '2.8.13';
 // 版本更新清单地址: 指向仓库根目录的 latest.json ({"version","notes","url","date","sha256"})
 // 发布新版本时的检查清单:
 //   1) npm version <新版本> —— 同时改好 package.json 与 package-lock.json
@@ -43,7 +50,7 @@ const APP_VERSION = '2.8.12';
 //   2) GitHub raw  —— 备用源 (部分网络下不可达, 所以放后面)
 // 只读第一项即可; 任何一项都不可达时静默跳过, 不影响任何功能
 const UPDATE_MANIFEST_URLS = [
-    'http://29b7a853.r21.cpolar.top/data/latest.json',
+    'http://28228fb4.r21.cpolar.top/data/latest.json',
     'https://raw.githubusercontent.com/HS435116/DawnDrama/main/latest.json'
 ];
 const DEFAULT_UPDATE_MANIFEST_URL = UPDATE_MANIFEST_URLS[0];   // 兼容旧引用 (界面默认显示第一个源)
@@ -98,6 +105,7 @@ class AgnesVideoGenerator {
 
         this._mergeChecked = new Set(); // 本会话已检查过"该集是否该合并"的集名 (避免重复弹窗)
         this._mergePrompts = new Set(); // 已提示过"分镜已齐, 要不要合并"的集名
+        this._rlWaiting = new Set();    // 正在"等限流冷却 + 等其他任务跑完"的任务ID (它们不占平台, 不算在途)
         this._autoLoopActive = false;   // 挂机 for 循环是否真的在跑 (与 _autoRunning 区分: 暂停态/恢复态可能只有状态没有循环)
 
         // 保存根目录的唯一来源: 服务器 /api/health 返回的 outputDir (即"模型设置 → 保存位置")。
@@ -618,7 +626,7 @@ class AgnesVideoGenerator {
         } else if (ok === jobs.length) {
             this.setProgressBar(100, `✅ 全部 ${jobs.length} 个任务生成成功！用时 ${elapsed} 秒`);
         } else {
-            const rl = this.haltSubmissions ? ' | 曾触发限流，未提交任务可在作品库"重试"' : '';
+            const rl = this.haltSubmissions ? ' | 平台限流中，剩余任务已自动延后提交' : '';
             this.setProgressBar(100, `完成: ${ok} 成功 / ${fail} 失败 / ${unknown} 未知 (用时 ${elapsed}s)${rl}`);
         }
         this.renderGallery();
@@ -691,6 +699,77 @@ class AgnesVideoGenerator {
     setProgressHeadline(text) {
         const textEl = document.getElementById('progress-text');
         if (textEl && text) textEl.textContent = text;
+    }
+
+    /* ================= 限流延后提交: 等其他任务跑完再自动提交 ================= */
+
+    /** 全局限流冷却剩余毫秒 (0 = 现在就能提交) */
+    _rateLimitCooldownMs() {
+        try {
+            return this.apiClient && this.apiClient.rateLimitCooldownMs
+                ? this.apiClient.rateLimitCooldownMs() : 0;
+        } catch (_) { return 0; }
+    }
+
+    /**
+     * 除自己之外, 还有几个任务真正占着平台 (提交中/轮询中/下载中)。
+     * 同伴还在跑时硬闯提交只会继续 429; 但同样在"等限流"的任务不算 ——
+     * 否则一批任务会互相把对方等成死锁, 谁都提交不出去。
+     */
+    _inFlightOthers(recordId) {
+        const ids = [];
+        const jobs = this._activeJobs || new Set();
+        jobs.forEach((id) => {
+            if (id === recordId) return;
+            if (this._rlWaiting && this._rlWaiting.has(id)) return;
+            ids.push(id);
+        });
+        return ids;
+    }
+
+    /**
+     * 限流延后: 等"其他任务跑完 + 平台全局限流冷却结束"再让调用方去提交。
+     *
+     * 平台配额是所有任务共享的。以前的做法是撞上限流就把后续任务判失败、要人回来点"重试",
+     * 挂机托管下没人点, 这些任务就永远停住 (用户看到的"因限流保护未提交")。
+     * 现在就地等: 同伴跑完 + 冷却走完, 自动解除限流保护并继续提交 —— 真正的无人值守。
+     *
+     * @returns {Promise<boolean>} true = 可以提交了; false = 等超时 / 用户点停止
+     */
+    async _waitForSubmitSlot(record, progressLabel = '', maxWaitMs = RL_MAX_WAIT_MS) {
+        if (!this._rlWaiting) this._rlWaiting = new Set();   // 兼容测试里只造了部分实例的情况
+        this._rlWaiting.add(record.id);
+        const startedAt = Date.now();
+        try {
+            for (;;) {
+                if (this.stopRequested) return false;
+                const cooldown = this._rateLimitCooldownMs();
+                const others = this._inFlightOthers(record.id);
+                if (cooldown <= 0 && others.length === 0) {
+                    // 冷却结束 + 同伴都跑完了: 自动解除限流保护, 把剩下的任务接着提交掉
+                    if (this.haltSubmissions) {
+                        this.haltSubmissions = false;
+                        this.showStatus('✅ 平台限流冷却结束，已自动继续提交剩余任务', 'success');
+                    }
+                    return true;
+                }
+                if (Date.now() - startedAt >= maxWaitMs) return false;
+                const waited = Math.round((Date.now() - startedAt) / 1000);
+                const what = others.length
+                    ? `等 ${others.length} 个任务跑完`
+                    : `等平台冷却 ${Math.max(1, Math.ceil(cooldown / 1000))}s`;
+                this.updateProgressItem(record.id, progressLabel,
+                    `⏳ 平台限流：${what}后自动提交 (已等 ${waited}s)`, 'waiting');
+                try {
+                    await this._sleepAbortable(Math.min(Math.max(cooldown, 1000), 5000));
+                } catch (e) {
+                    if (e && e.cancelled) return false;
+                    throw e;
+                }
+            }
+        } finally {
+            this._rlWaiting.delete(record.id);
+        }
     }
 
     /** 提交节流阀: 保证相邻两次提交间隔不小于 submitStaggerMs (限流后自动加倍) */
@@ -795,18 +874,30 @@ class AgnesVideoGenerator {
             this.showStatus('⏹️ 已停止：新任务不再提交，请等当前批次结束后再重试', 'warning');
             return 'skipped';
         }
-        // 前序任务触发限流时，不再提交新任务 (已提交的任务监控不受影响)
-        if (this.haltSubmissions) {
-            record.status = 'failed';
-            // 欠费与限流都会拦住提交, 但原因完全不同: 提示必须说实话, 否则用户会照着限流的建议白等
-            record.error = this._billingBlocked
-                ? '平台账户欠费（余额不足/配额耗尽），本任务未提交。记录与提交参数已保留，充值后点"重试"即可'
-                : '前序任务触发平台限流，本任务未提交。请稍后在作品库点击"重试"';
-            record.finishedAt = Date.now();
-            this.saveHistory(); this.renderGallery();
-            this.updateProgressItem(record.id, progressLabel, this._billingBlocked ? '💳 因平台欠费未提交' : '⏸️ 因限流保护未提交', 'failed');
-            
-            return 'failed';
+        // 前序任务触发限流 (或平台还在冷却) 时不再把这条判失败 ——
+        // 挂机托管下没人回来点"重试", 判失败就是把任务永久停住。
+        // 就地等: ① 其他任务跑完 ② 全局限流冷却结束, 然后自动接着提交 (见 _waitForSubmitSlot)。
+        if (this.haltSubmissions || this._rateLimitCooldownMs() > 0) {
+            // 欠费不属于"等一下就好": 充值前等到天亮也没用, 立刻收住并把真实原因说清楚
+            if (this._billingBlocked) {
+                record.status = 'failed';
+                record.error = '平台账户欠费（余额不足/配额耗尽），本任务未提交。记录与提交参数已保留，充值后点"重试"即可';
+                record.finishedAt = Date.now();
+                this.saveHistory(); this.renderGallery();
+                this.updateProgressItem(record.id, progressLabel, '💳 因平台欠费未提交', 'failed');
+                return 'failed';
+            }
+            const ready = await this._waitForSubmitSlot(record, progressLabel);
+            if (!ready) {
+                if (this.stopRequested) return this._markRecordStopped(record, progressLabel);
+                record.status = 'failed';
+                record.error = `平台持续限流：本任务已自动等了 ${Math.round(RL_MAX_WAIT_MS / 60000)} 分钟仍没排上，先留在这里。`
+                    + '可把「模型设置 → 高级参数 → 提交间隔」调大 (如 10~30 秒) 后点"重试"，或稍后再试';
+                record.finishedAt = Date.now();
+                this.saveHistory(); this.renderGallery();
+                this.updateProgressItem(record.id, progressLabel, '⏸️ 等了很久仍未排上，可稍后重试', 'failed');
+                return 'failed';
+            }
         }
 
         const req = record.request || { prompt: record.title, duration: 5, resolution: '720p', ratio: '16:9' };
@@ -942,6 +1033,26 @@ class AgnesVideoGenerator {
         } catch (error) {
             // 用户点了"停止": 不算失败, 标记为已停止 (有平台任务 ID 的可用"任务扫描"找回)
             if (error && error.cancelled) return this._markRecordStopped(record, progressLabel);
+            // 平台限流: 这条还没提交过 (没有平台任务ID, 重来不会产生重复任务) 就自动延后 ——
+            // 回到本方法开头, 由 _waitForSubmitSlot 等其他任务跑完 + 等冷却结束, 再自动重新提交。
+            // 这样挂机上"谁撞了限流"也能自己爬起来, 不需要人回来点重试。
+            if (AgnesAPIClient.isPlatformBusyError(error) && !record.apiTaskId && !this.stopRequested
+                && (record.rlDeferrals || 0) < RL_MAX_DEFERRALS) {
+                record.rlDeferrals = (record.rlDeferrals || 0) + 1;
+                record.status = 'queued';           // 仍是"待提交", 不是失败 —— 挂机循环据此继续等它
+                record.error = `平台限流：已自动延后提交（第 ${record.rlDeferrals}/${RL_MAX_DEFERRALS} 次），`
+                    + '会等其他任务跑完并等冷却结束后自动重试';
+                record.errorTech = error.message;
+                record.finishedAt = null;
+                // 只阻止后续新提交，绝不打断已提交任务的监控
+                this.haltSubmissions = true;
+                this.submitStaggerMs = Math.min((this.submitStaggerMs || 2000) * 2, 60000);
+                this.saveHistory(); this.renderGallery();
+                this.updateProgressItem(record.id, progressLabel,
+                    `⏳ 平台限流：已自动延后 (第 ${record.rlDeferrals}/${RL_MAX_DEFERRALS} 次)，等其他任务跑完再自动提交`, 'waiting');
+                this.showStatus('⏳ 平台限流：本任务已自动延后，将等其他任务跑完并冷却后自动重试 (无需手动操作)', 'warning');
+                return this._submitAndMonitorInner(record, progressLabel);
+            }
             console.error(`❌ 任务 ${progressLabel} 提交失败:`, error);
             const billing = this.isBillingError(error);
             record.status = 'failed';
@@ -1518,6 +1629,7 @@ class AgnesVideoGenerator {
                 status: 'queued', progress: 0, error: null, url: null,
                 apiTaskId: null, finishedAt: null, rawResponse: null,
                 duplicateOf: null, submitStarted: false,
+                rlDeferrals: null,          // 手动重试 = 新的开始, 延后次数重新计
                 date: new Date().toLocaleString('zh-CN')
             });
             this.renderGallery();
@@ -2301,7 +2413,8 @@ class AgnesVideoGenerator {
                 <p><strong>🤖 短剧工坊</strong>：文本AI根据主提示词延伸每集剧情；人物面孔/声音/服装全剧锁定（程序化校验补全）；一键生成下一集；全剧挂机到完结（可暂停/停止）。</p>
                 <p><strong>📚 剧本存档</strong>：一键保存整部剧本（含人物锁定卡），导入即可延续人物一致性生成续季；支持导出/导入 JSON 跨设备迁移。</p>
                 <p><strong>🔌 多平台接入</strong>：火山方舟 (Seedance) / OpenAI 兼容 / 完全自定义 JSON 三种预设 + 自动识别；模型列表拉取或任意自定义模型 ID；通用本地代理绕过 CORS。</p>
-                <p><strong>🛡️ 限流自适应</strong>：提交全局串行排队 + 共享冷却时钟，429 自动退避重试（窗口约 5.5 分钟）；轮询与提交共享配额协调。</p>
+                <p><strong>🛡️ 限流自适应</strong>：提交全局串行排队 + 共享冷却时钟，429 自动退避重试（窗口约 5.5 分钟）；轮询与提交共享配额协调。<br>
+                挂机时撞上限流不会把任务丢给你手动重试：会自动等其他任务跑完、等冷却结束再重新提交（同一任务最多自动延后 3 次，每次最多等 30 分钟），全程无人值守。</p>
                 <p><strong>🔍 任务扫描</strong>：合并重复任务、逐个查询平台真实状态、补全取回已完成视频；实时扫描进度条。</p>
                 <p><strong>💬 友好提示</strong>：失败原因全部中文化并给出下一步建议；技术细节折叠保留供排查。</p>
                 <p><strong>🖥️ 桌面版</strong>：无边框窗口 + 自定义标题栏 + 应用图标；作品保存位置可自定义、一键打开所在文件夹。</p>
@@ -3508,13 +3621,11 @@ class AgnesVideoGenerator {
                 throw new Error('未找到作品目录');
             }
 
-            // 调用 Electron 的合并功能 (传入绝对路径确保 Python 脚本正确定位)
-            let absEpisodeDir = episodeDir;
-            if (this.serverMode && (this.serverOutputDir || this.outputPaths.base)) {
-                const base = (this.serverOutputDir || this.outputPaths.base).replace(/[\\/]+$/, '');
-                const rel = episodeDir.replace(/^\.\//, '');
-                absEpisodeDir = base + (rel.startsWith('/') || rel.startsWith('\\') ? '' : '/') + rel;
-            }
+            // 调用 Electron 的合并功能, 必须传绝对路径 (Python 脚本要按它定位分镜)。
+            // getEpisodeDir 已经返回 <保存位置>/video/<标题> 这个绝对路径, 这里不能再套一层保存根 ——
+            // 以前就是这么套的, 结果是 <保存位置>/<保存位置>/video/<标题>, 这个目录不存在,
+            // 合并直接报"剧集文件夹不存在" (桌面版自动合并/单集合并/挂机出成片全被它挡住)。
+            const absEpisodeDir = episodeDir;
             let relPath = null;
             let subInfo = null;      // 字幕到底烧成功没有: 脚本会如实回报, 别再无脑说"已烧录"
             let subReason = '';      // 没烧上的原因 (由合并脚本给出)

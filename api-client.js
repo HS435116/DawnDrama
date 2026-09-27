@@ -63,6 +63,12 @@ class AgnesAPIClient {
     /** 当前生效的提交最小间隔 (平台繁忙时自动加倍, 上限 60s) */
     submitGapMs() { return this._submitGap || this._submitGapBase || 2000; }
 
+    /**
+     * 全局限流冷却剩余毫秒 (0 = 现在就能提交)。
+     * 界面用它显示"还要等多久", 并据此决定什么时候自动重新提交 —— 见 app.js _waitForSubmitSlot。
+     */
+    rateLimitCooldownMs() { return Math.max(0, (this._rlUntil || 0) - Date.now()); }
+
     /** 平台繁忙: 拉大提交间隔, 给平台喘息时间 (队列模式的关键) */
     _widenSubmitGap() {
         this._submitGap = Math.min(Math.round((this._submitGap || this._submitGapBase) * 2), 60000);
